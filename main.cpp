@@ -6,11 +6,15 @@
 
 constexpr uint32_t FRAME_MAGIC_NUMBER = 0x184D2204;
 
-// reads sizeof(T) bytes from file into value. returns false on read failure.
-// assumes a little-endian host (x86/CUDA).
-template <typename T> bool read_raw(std::ifstream &file, T &value) {
-  return static_cast<bool>(
-      file.read(reinterpret_cast<char *>(&value), sizeof(value)));
+// little-endian byte loads — explicit, so they don't depend on host byte order
+inline uint16_t load_u16_le(const uint8_t *p) {
+  return static_cast<uint16_t>(p[0] | (p[1] << 8));
+}
+
+inline uint32_t load_u32_le(const uint8_t *p) {
+  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+         (static_cast<uint32_t>(p[2]) << 16) |
+         (static_cast<uint32_t>(p[3]) << 24);
 }
 
 struct LZ4FrameHeaderRaw {
@@ -32,7 +36,7 @@ struct LZ4FrameConfig {
 struct LZ4BlockInfo {
   uint32_t data_size;
   bool is_compressed;
-  std::streampos file_offset;
+  size_t data_offset; // byte offset of the block body within the file buffer
 };
 
 LZ4FrameConfig parse_frame_header(const LZ4FrameHeaderRaw &raw) {
@@ -67,65 +71,65 @@ LZ4FrameConfig parse_frame_header(const LZ4FrameHeaderRaw &raw) {
   return config;
 }
 
-// decompresses one lz4 block into dest (which holds dest_capacity bytes).
-// returns the number of uncompressed bytes, or -1 on a malformed
-// block. little endian is assumed
-int64_t parse_data_block(std::ifstream &file, LZ4BlockInfo block_info,
-                         uint8_t *dest, size_t dest_capacity) {
-  file.seekg(block_info.file_offset);
-
-  if (!block_info.is_compressed) {
-    if (block_info.data_size > dest_capacity) {
+// decompresses one lz4 block from src (src_len bytes) into dest (which holds
+// dest_capacity bytes). returns the number of uncompressed bytes, or -1 on a
+// malformed block. 
+int64_t parse_data_block(const uint8_t *src, size_t src_len,
+                            bool is_compressed, uint8_t *dest,
+                            size_t dest_capacity) {
+  if (!is_compressed) {
+    if (src_len > dest_capacity) {
       return -1;
     }
-    file.read(reinterpret_cast<char *>(dest), block_info.data_size);
-    if (!file) {
-      return -1;
+    for (size_t i = 0; i < src_len; i++) {
+      dest[i] = src[i];
     }
-    return block_info.data_size;
+    return static_cast<int64_t>(src_len);
   }
 
   // compressed block
   // iterate over sequences until exit condition is met
+  size_t src_pos = 0;
   size_t dest_pos = 0;
-  while ((file.tellg() - block_info.file_offset) < block_info.data_size) {
-    uint8_t token;
-    if (!read_raw(file, token)) {
-      return -1;
-    }
+  while (src_pos < src_len) {
+    uint8_t token = src[src_pos++];
 
     size_t num_literals = token >> 4; // high bits
     if (num_literals == 15) {
       uint8_t next_byte;
       do {
-        if (!read_raw(file, next_byte)) {
+        if (src_pos >= src_len) {
           return -1;
         }
+        next_byte = src[src_pos++];
         num_literals += next_byte;
       } while (next_byte == 255);
     }
 
     if (num_literals > 0) {
-      if (dest_pos + num_literals > dest_capacity) {
+      if (src_pos + num_literals > src_len ||
+          dest_pos + num_literals > dest_capacity) {
         return -1;
       }
-      file.read(reinterpret_cast<char *>(dest + dest_pos), num_literals);
-      if (!file) {
-        return -1;
+      for (size_t i = 0; i < num_literals; i++) {
+        dest[dest_pos + i] = src[src_pos + i];
       }
+      src_pos += num_literals;
       dest_pos += num_literals;
     }
 
     // the last sequence in a block is literals only and ends here
     // TODO: check for end of block requirements
-    if ((file.tellg() - block_info.file_offset) >= block_info.data_size) {
+    if (src_pos >= src_len) {
       break;
     }
 
-    uint16_t offset;
-    if (!read_raw(file, offset)) {
+    // 2-byte little-endian match offset
+    if (src_pos + 2 > src_len) {
       return -1;
     }
+    uint16_t offset = load_u16_le(src + src_pos);
+    src_pos += 2;
 
     // offset 0 is invalid; a match must not reach before the start of output
     if (offset == 0 || offset > dest_pos) {
@@ -135,9 +139,10 @@ int64_t parse_data_block(std::ifstream &file, LZ4BlockInfo block_info,
     if (match_length == 15) {
       uint8_t next_byte = 0;
       do {
-        if (!read_raw(file, next_byte)) {
+        if (src_pos >= src_len) {
           return -1;
         }
+        next_byte = src[src_pos++];
         match_length += next_byte;
       } while (next_byte == 255);
     }
@@ -164,16 +169,42 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  // read the whole compressed file into memory once. this is also the buffer
+  // we would cudaMemcpy to the device in a single transfer. size it up front
+  // and do a single bulk read instead of growing byte-by-byte.
+  file.seekg(0, std::ios::end);
+  std::streamoff file_size = file.tellg();
+  if (file_size < 0) {
+    std::cout << "could not determine file size!\n";
+    return 1;
+  }
+  file.seekg(0, std::ios::beg);
+
+  std::vector<uint8_t> data(static_cast<size_t>(file_size));
+  if (!file.read(reinterpret_cast<char *>(data.data()), file_size)) {
+    std::cout << "could not read file!\n";
+    return 1;
+  }
+
+  // smallest possible frame: 4-byte magic + flg + bd + 1-byte header checksum
+  // TODO: not sure if this is necessary
+  if (data.size() < 7) {
+    std::cout << "file too small!\n";
+    return 1;
+  }
+
+  size_t pos = 0;
   LZ4FrameHeaderRaw raw;
-  read_raw(file, raw.magic_number);
+  raw.magic_number = load_u32_le(data.data() + pos);
+  pos += sizeof(raw.magic_number);
 
   if (raw.magic_number != FRAME_MAGIC_NUMBER) {
     std::cout << "file corrupted!\n";
     return 1;
   }
 
-  read_raw(file, raw.flg);
-  read_raw(file, raw.bd);
+  raw.flg = data[pos++];
+  raw.bd = data[pos++];
 
   LZ4FrameConfig config = parse_frame_header(raw);
 
@@ -192,41 +223,46 @@ int main(int argc, char *argv[]) {
 
   // TODO: deal with content_size and dict_id properly
   if (config.content_size_present) {
-    file.seekg(8, std::ios::cur);
+    pos += 8;
   }
   if (config.dict_id_present) {
-    file.seekg(4, std::ios::cur);
+    pos += 4;
   }
 
   // TODO: verify the header_checksum
-  uint8_t header_checksum = 0;
-  read_raw(file, header_checksum);
+  pos += 1; // header checksum (HC)
 
   std::cout << "header parsed. max block size: " << config.max_block_size_bytes
             << " bytes" << std::endl;
 
   // read all the block headers
   std::vector<LZ4BlockInfo> blocks;
-  while (true) {
-    uint32_t block_size_field = 0;
-    read_raw(file, block_size_field);
+  while (pos + 4 <= data.size()) {
+    uint32_t block_size_field = load_u32_le(data.data() + pos);
+    pos += 4;
 
-    if (!file || block_size_field == 0) { // 0x00000000 endmark
+    if (block_size_field == 0) { // 0x00000000 endmark
       break;
     }
 
     LZ4BlockInfo block;
     block.is_compressed = !(block_size_field & (1U << 31));
     block.data_size = block_size_field & ~(1U << 31);
-    block.file_offset = file.tellg();
+    block.data_offset = pos;
+
+    // make sure the block body is actually present in the buffer
+    if (pos + block.data_size > data.size()) {
+      std::cout << "truncated block body!\n";
+      break;
+    }
 
     blocks.push_back(block);
 
-    // seek to next block header
-    file.seekg(block.data_size, std::ios::cur);
+    // seek past the block body to the next block header
+    pos += block.data_size;
     // TODO: verify block checksum
     if (config.block_checksum) {
-      file.seekg(4, std::ios::cur);
+      pos += 4;
     }
   }
 
@@ -235,8 +271,9 @@ int main(int argc, char *argv[]) {
   std::vector<uint8_t> out(config.max_block_size_bytes);
 
   for (size_t i = 0; i < blocks.size(); ++i) {
-    int64_t uncompressed_size =
-        parse_data_block(file, blocks[i], out.data(), out.size());
+    int64_t uncompressed_size = parse_data_block(
+        data.data() + blocks[i].data_offset, blocks[i].data_size,
+        blocks[i].is_compressed, out.data(), out.size());
     if (uncompressed_size < 0) {
       std::cout << "block " << i << ": malformed/corrupt, decode failed\n";
       continue;
@@ -244,7 +281,7 @@ int main(int argc, char *argv[]) {
     std::cout << "block " << i << ": size = " << blocks[i].data_size
               << " bytes, compressed = "
               << (blocks[i].is_compressed ? "yes" : "no")
-              << ", offset = " << blocks[i].file_offset
+              << ", offset = " << blocks[i].data_offset
               << ", uncompressed size = " << uncompressed_size << " bytes:\n";
     std::cout.write(reinterpret_cast<char *>(out.data()), uncompressed_size);
     std::cout << '\n';
