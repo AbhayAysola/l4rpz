@@ -15,7 +15,12 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
-add_executable(l4rpz src/main.cpp)
+add_executable(l4rpz
+  src/main.cpp
+  src/lz4_frame.cpp
+)
+
+target_include_directories(l4rpz PRIVATE src/include)
 
 target_compile_options(l4rpz PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>

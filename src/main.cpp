@@ -3,73 +3,10 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include "lz4.hpp"
+#include "lz4_frame.hpp"
 
-constexpr uint32_t FRAME_MAGIC_NUMBER = 0x184D2204;
 
-// little-endian byte loads — explicit, so they don't depend on host byte order
-inline uint16_t load_u16_le(const uint8_t *p) {
-  return static_cast<uint16_t>(p[0] | (p[1] << 8));
-}
-
-inline uint32_t load_u32_le(const uint8_t *p) {
-  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
-         (static_cast<uint32_t>(p[2]) << 16) |
-         (static_cast<uint32_t>(p[3]) << 24);
-}
-
-struct LZ4FrameHeaderRaw {
-  uint32_t magic_number;
-  uint8_t flg;
-  uint8_t bd;
-};
-
-struct LZ4FrameConfig {
-  uint32_t version;
-  bool block_independence;
-  bool block_checksum;
-  bool content_size_present;
-  bool content_checksum;
-  bool dict_id_present;
-  uint32_t max_block_size_bytes;
-};
-
-struct LZ4BlockInfo {
-  uint32_t data_size;
-  bool is_compressed;
-  size_t data_offset; // byte offset of the block body within the file buffer
-};
-
-LZ4FrameConfig parse_frame_header(const LZ4FrameHeaderRaw &raw) {
-  LZ4FrameConfig config;
-
-  config.version = (raw.flg >> 6) & 3;
-  config.block_independence = (raw.flg >> 5) & 1;
-  config.block_checksum = (raw.flg >> 4) & 1;
-  config.content_size_present = (raw.flg >> 3) & 1;
-  config.content_checksum = (raw.flg >> 2) & 1;
-  config.dict_id_present = raw.flg & 1;
-
-  uint8_t size_index = (raw.bd >> 4) & 7;
-  switch (size_index) {
-  case 4:
-    config.max_block_size_bytes = 64 * 1024;
-    break;
-  case 5:
-    config.max_block_size_bytes = 256 * 1024;
-    break;
-  case 6:
-    config.max_block_size_bytes = 1024 * 1024;
-    break;
-  case 7:
-    config.max_block_size_bytes = 4 * 1024 * 1024;
-    break;
-  default:
-    config.max_block_size_bytes = 0;
-    break;
-  }
-
-  return config;
-}
 
 // decompresses one lz4 block from src (src_len bytes) into dest (which holds
 // dest_capacity bytes). returns the number of uncompressed bytes, or -1 on a
