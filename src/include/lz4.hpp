@@ -3,8 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifdef __CUDACC__
+#define HD __host__ __device__
+#else
+#define HD
+#endif
+
 // little-endian byte loads — explicit, so they don't depend on host byte order
-inline uint16_t load_u16_le(const uint8_t *p) {
+inline HD uint16_t load_u16_le(const uint8_t *p) {
   return static_cast<uint16_t>(p[0] | (p[1] << 8));
 }
 

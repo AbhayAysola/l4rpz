@@ -18,6 +18,8 @@ endif()
 add_executable(l4rpz
   src/main.cpp
   src/lz4_frame.cpp
+  # src/decompress.cpp # TODO: add better way to switch between cpu and gpu implementation
+  src/decompress.cu
 )
 
 target_include_directories(l4rpz PRIVATE src/include)
