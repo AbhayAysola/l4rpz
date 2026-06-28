@@ -1,4 +1,4 @@
-#include "decompress.hpp"
+#include "search.hpp"
 #include "lz4.hpp"
 #include "lz4_frame.hpp"
 
@@ -90,40 +90,56 @@ static __device__ int64_t parse_data_block(const uint8_t *src, size_t src_len,
   return static_cast<int64_t>(dest_pos);
 }
 
-// one thread per block — safe because we require block_independence
-__global__ void decompress_kernel(const uint8_t *compressed,
-                                  const LZ4BlockInfo *blocks, int num_blocks,
-                                  uint8_t *output, int64_t *output_sizes,
-                                  size_t max_block_size) {
+// one thread per block: decompress then search. storing strided offsets
+// (i * max_block_size + o) so the cpu can convert to logical offsets using
+// prefix sums of output_sizes after the kernel completes.
+__global__ void decompress_and_search_kernel(
+    const uint8_t *compressed, const LZ4BlockInfo *blocks, int num_blocks,
+    uint8_t *decompressed, int64_t *output_sizes, size_t max_block_size,
+    const uint8_t *pattern, int pattern_len,
+    size_t *matches, int *match_count, int max_matches) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= num_blocks) return;
 
-  uint8_t *dest = output + (size_t)i * max_block_size;
-  output_sizes[i] = parse_data_block(compressed + blocks[i].data_offset,
-                                     blocks[i].data_size,
-                                     blocks[i].is_compressed,
-                                     dest, max_block_size);
+  uint8_t *dest = decompressed + (size_t)i * max_block_size;
+  int64_t n = parse_data_block(compressed + blocks[i].data_offset,
+                               blocks[i].data_size, blocks[i].is_compressed,
+                               dest, max_block_size);
+  output_sizes[i] = n;
+  if (n < 0 || pattern_len == 0) return;
+
+  for (int64_t o = 0; o <= n - pattern_len; o++) {
+    bool found = true;
+    for (int j = 0; j < pattern_len && found; j++) {
+      if (dest[o + j] != pattern[j]) found = false;
+    }
+    if (found) {
+      int idx = atomicAdd(match_count, 1);
+      if (idx < max_matches)
+        matches[idx] = (size_t)i * max_block_size + (size_t)o;
+    }
+  }
 }
 
-std::vector<uint8_t> decompress_frame(const uint8_t *data, size_t size) {
+std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size, const std::string &pattern) {
   // smallest compressed file size TODO: need to verify
-  if (size < 7) return {};
+  if (size < 7) return std::nullopt;
 
   size_t pos = 0;
   LZ4FrameHeaderRaw raw;
   raw.magic_number = load_u32_le(data + pos);
   pos += sizeof(raw.magic_number);
 
-  if (raw.magic_number != FRAME_MAGIC_NUMBER) return {};
+  if (raw.magic_number != FRAME_MAGIC_NUMBER) return std::nullopt;
 
   raw.flg = data[pos++];
   raw.bd = data[pos++];
 
   LZ4FrameConfig config = parse_frame_header(raw);
 
-  if (config.version != 1) return {};
-  if (!config.block_independence) return {};
-  if (config.max_block_size_bytes == 0) return {};
+  if (config.version != 1) return std::nullopt;
+  if (!config.block_independence) return std::nullopt;
+  if (config.max_block_size_bytes == 0) return std::nullopt;
 
   // TODO: deal with content_size and dict_id properly
   if (config.content_size_present) pos += 8;
@@ -161,11 +177,18 @@ std::vector<uint8_t> decompress_frame(const uint8_t *data, size_t size) {
   int num_blocks = static_cast<int>(blocks.size());
   size_t max_block_size = config.max_block_size_bytes;
 
-  // upload compressed data and block descriptors
+  // upper bound on matches: every position could be a match
+  size_t max_matches = (size_t)num_blocks * max_block_size / pattern.size() + 1;
+  int pattern_len = static_cast<int>(pattern.size());
+
+  // upload compressed data, block descriptors, and pattern
   uint8_t *d_compressed = nullptr;
   LZ4BlockInfo *d_blocks = nullptr;
-  uint8_t *d_output = nullptr;
+  uint8_t *d_decompressed = nullptr;
   int64_t *d_output_sizes = nullptr;
+  uint8_t *d_pattern = nullptr;
+  size_t *d_matches = nullptr;
+  int *d_match_count = nullptr;
 
   cudaMalloc(&d_compressed, size);
   cudaMemcpy(d_compressed, data, size, cudaMemcpyHostToDevice);
@@ -174,38 +197,59 @@ std::vector<uint8_t> decompress_frame(const uint8_t *data, size_t size) {
   cudaMemcpy(d_blocks, blocks.data(), num_blocks * sizeof(LZ4BlockInfo),
              cudaMemcpyHostToDevice);
 
-  // stride layout: block i writes to d_output + i * max_block_size
-  cudaMalloc(&d_output, num_blocks * max_block_size);
+  // stride layout: block i writes to d_decompressed + i * max_block_size
+  cudaMalloc(&d_decompressed, (size_t)num_blocks * max_block_size);
   cudaMalloc(&d_output_sizes, num_blocks * sizeof(int64_t));
+
+  cudaMalloc(&d_pattern, pattern_len);
+  cudaMemcpy(d_pattern, pattern.data(), pattern_len, cudaMemcpyHostToDevice);
+
+  cudaMalloc(&d_matches, max_matches * sizeof(size_t));
+  cudaMalloc(&d_match_count, sizeof(int));
+  cudaMemset(d_match_count, 0, sizeof(int));
 
   int threads = 256;
   int grid = (num_blocks + threads - 1) / threads;
-  decompress_kernel<<<grid, threads>>>(d_compressed, d_blocks, num_blocks,
-                                      d_output, d_output_sizes, max_block_size);
+  decompress_and_search_kernel<<<grid, threads>>>(
+      d_compressed, d_blocks, num_blocks, d_decompressed, d_output_sizes,
+      max_block_size, d_pattern, pattern_len, d_matches, d_match_count,
+      static_cast<int>(max_matches));
   cudaDeviceSynchronize();
 
   // copy results back
+  int match_count = 0;
+  cudaMemcpy(&match_count, d_match_count, sizeof(int), cudaMemcpyDeviceToHost);
+
   std::vector<int64_t> output_sizes(num_blocks);
   cudaMemcpy(output_sizes.data(), d_output_sizes,
              num_blocks * sizeof(int64_t), cudaMemcpyDeviceToHost);
 
-  std::vector<uint8_t> h_output(num_blocks * max_block_size);
-  cudaMemcpy(h_output.data(), d_output, num_blocks * max_block_size,
+  std::vector<size_t> h_matches(match_count);
+  cudaMemcpy(h_matches.data(), d_matches, match_count * sizeof(size_t),
              cudaMemcpyDeviceToHost);
 
   cudaFree(d_compressed);
   cudaFree(d_blocks);
-  cudaFree(d_output);
+  cudaFree(d_decompressed);
   cudaFree(d_output_sizes);
+  cudaFree(d_pattern);
+  cudaFree(d_matches);
+  cudaFree(d_match_count);
 
-  // pack strided output into a contiguous result
-  std::vector<uint8_t> result;
+  // compute prefix sums to convert strided offsets to logical offsets
+  // TODO: experiment, maybe we should do this on the gpu?
+  std::vector<size_t> prefix(num_blocks + 1, 0);
   for (int i = 0; i < num_blocks; i++) {
-    if (output_sizes[i] < 0) return {};
-    size_t off = (size_t)i * max_block_size;
-    result.insert(result.end(),
-                  h_output.begin() + off,
-                  h_output.begin() + off + output_sizes[i]);
+    if (output_sizes[i] < 0) return std::nullopt;
+    prefix[i + 1] = prefix[i] + static_cast<size_t>(output_sizes[i]);
+  }
+
+  std::vector<size_t> result;
+  result.reserve(match_count);
+  for (int i = 0; i < match_count; i++) {
+    int block_idx = static_cast<int>(h_matches[i] / max_block_size);
+    size_t within = h_matches[i] % max_block_size;
+    result.push_back(prefix[block_idx] + within);
   }
 
   return result;
