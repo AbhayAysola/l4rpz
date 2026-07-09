@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "search.hpp"
 #include "lz4.hpp"
 #include "lz4_frame.hpp"
@@ -108,12 +109,15 @@ __global__ void decompress_and_search_kernel(
   output_sizes[i] = n;
   if (n < 0 || pattern_len == 0) return;
 
+  // naive pattern search. can be optimized maybe?
   for (int64_t o = 0; o <= n - pattern_len; o++) {
     bool found = true;
     for (int j = 0; j < pattern_len && found; j++) {
       if (dest[o + j] != pattern[j]) found = false;
     }
     if (found) {
+      // we need atomicAdd here since multiple threads write to match_count at once
+      // maybe theres a better way?
       int idx = atomicAdd(match_count, 1);
       if (idx < max_matches)
         matches[idx] = (size_t)i * max_block_size + (size_t)o;
@@ -121,7 +125,8 @@ __global__ void decompress_and_search_kernel(
   }
 }
 
-std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size, const std::string &pattern) {
+std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size,
+                                                 const std::string &pattern) {
   // smallest compressed file size TODO: need to verify
   if (size < 7) return std::nullopt;
 
@@ -175,82 +180,160 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
   }
 
   int num_blocks = static_cast<int>(blocks.size());
+  if (num_blocks == 0) return std::vector<size_t>{};
   size_t max_block_size = config.max_block_size_bytes;
-
-  // upper bound on matches: every position could be a match
-  size_t max_matches = (size_t)num_blocks * max_block_size / pattern.size() + 1;
   int pattern_len = static_cast<int>(pattern.size());
 
-  // upload compressed data, block descriptors, and pattern
-  uint8_t *d_compressed = nullptr;
-  LZ4BlockInfo *d_blocks = nullptr;
-  uint8_t *d_decompressed = nullptr;
-  int64_t *d_output_sizes = nullptr;
-  uint8_t *d_pattern = nullptr;
-  size_t *d_matches = nullptr;
-  int *d_match_count = nullptr;
+  // --- fixed allocations: stay on device across all chunks ---
+  uint8_t    *d_compressed = nullptr;
+  LZ4BlockInfo *d_blocks   = nullptr;
+  uint8_t    *d_pattern    = nullptr;
 
   cudaMalloc(&d_compressed, size);
   cudaMemcpy(d_compressed, data, size, cudaMemcpyHostToDevice);
 
-  cudaMalloc(&d_blocks, num_blocks * sizeof(LZ4BlockInfo));
-  cudaMemcpy(d_blocks, blocks.data(), num_blocks * sizeof(LZ4BlockInfo),
+  cudaMalloc(&d_blocks, (size_t)num_blocks * sizeof(LZ4BlockInfo));
+  cudaMemcpy(d_blocks, blocks.data(), (size_t)num_blocks * sizeof(LZ4BlockInfo),
              cudaMemcpyHostToDevice);
 
-  // stride layout: block i writes to d_decompressed + i * max_block_size
-  cudaMalloc(&d_decompressed, (size_t)num_blocks * max_block_size);
-  cudaMalloc(&d_output_sizes, num_blocks * sizeof(int64_t));
+  cudaMalloc(&d_pattern, (size_t)pattern_len);
+  cudaMemcpy(d_pattern, pattern.data(), (size_t)pattern_len, cudaMemcpyHostToDevice);
 
-  cudaMalloc(&d_pattern, pattern_len);
-  cudaMemcpy(d_pattern, pattern.data(), pattern_len, cudaMemcpyHostToDevice);
+  // --- compute chunk size from available VRAM ---
+  size_t vram_free;
+  cudaMemGetInfo(&vram_free, nullptr);
 
-  cudaMalloc(&d_matches, max_matches * sizeof(size_t));
-  cudaMalloc(&d_match_count, sizeof(int));
-  cudaMemset(d_match_count, 0, sizeof(int));
+  const size_t headroom = 256ULL << 20; // 256 MB cushion for driver + other allocations TODO: check if this is good enough
+  size_t available = (vram_free > headroom) ? vram_free - headroom : 0;
 
-  int threads = 256;
-  int grid = (num_blocks + threads - 1) / threads;
-  decompress_and_search_kernel<<<grid, threads>>>(
-      d_compressed, d_blocks, num_blocks, d_decompressed, d_output_sizes,
-      max_block_size, d_pattern, pattern_len, d_matches, d_match_count,
-      static_cast<int>(max_matches));
-  cudaDeviceSynchronize();
+  // worst-case matches per block: every position in the decompressed block
+  size_t max_matches_per_block = max_block_size / (size_t)std::max(pattern_len, 1) + 1;
+  size_t per_block_bytes = max_block_size                           // d_decompressed
+                         + sizeof(int64_t)                          // d_output_sizes
+                         + max_matches_per_block * sizeof(size_t);  // d_matches
 
-  // copy results back
-  int match_count = 0;
-  cudaMemcpy(&match_count, d_match_count, sizeof(int), cudaMemcpyDeviceToHost);
+  // two buffer slots, so each slot gets half the available space
+  size_t blocks_per_chunk = (available / 2) / std::max(per_block_bytes, (size_t)1);
+  blocks_per_chunk = std::clamp(blocks_per_chunk, (size_t)1, (size_t)num_blocks);
 
-  std::vector<int64_t> output_sizes(num_blocks);
-  cudaMemcpy(output_sizes.data(), d_output_sizes,
-             num_blocks * sizeof(int64_t), cudaMemcpyDeviceToHost);
+  size_t max_matches_per_chunk = blocks_per_chunk * max_matches_per_block;
 
-  std::vector<size_t> h_matches(match_count);
-  cudaMemcpy(h_matches.data(), d_matches, match_count * sizeof(size_t),
-             cudaMemcpyDeviceToHost);
+  // --- double-buffered device + pinned host allocations ---
+  uint8_t  *d_decompressed[2] = {};
+  int64_t  *d_output_sizes[2] = {};
+  size_t   *d_matches[2]      = {};
+  int      *d_match_count[2]  = {};
+
+  int64_t  *h_output_sizes[2] = {};
+  size_t   *h_matches[2]      = {};
+  int      *h_match_count[2]  = {};
+
+  for (int b = 0; b < 2; b++) {
+    cudaMalloc(&d_decompressed[b], blocks_per_chunk * max_block_size);
+    cudaMalloc(&d_output_sizes[b], blocks_per_chunk * sizeof(int64_t));
+    cudaMalloc(&d_matches[b],  max_matches_per_chunk * sizeof(size_t));
+    cudaMalloc(&d_match_count[b],  sizeof(int));
+    cudaMallocHost(&h_output_sizes[b], blocks_per_chunk * sizeof(int64_t));
+    cudaMallocHost(&h_matches[b],      max_matches_per_chunk * sizeof(size_t));
+    cudaMallocHost(&h_match_count[b],  sizeof(int));
+    *h_match_count[b] = 0;
+  }
+
+  cudaStream_t streams[2];
+  cudaStreamCreate(&streams[0]);
+  cudaStreamCreate(&streams[1]);
+
+  // prefix[i] = logical byte offset at the start of block i across the whole frame
+  std::vector<size_t> prefix(num_blocks + 1, 0);
+  std::vector<size_t> result;
+
+  struct PendingChunk { int chunk_idx, block_start, block_count; };
+  PendingChunk pending[2] = {{-1, 0, 0}, {-1, 0, 0}};
+  bool error = false;
+
+  // sync slot s, fill prefix sums, convert strided offsets to logical, clear pending
+  auto flush_slot = [&](int s) -> bool {
+    if (pending[s].chunk_idx < 0) return true;
+    cudaStreamSynchronize(streams[s]);
+    int bstart = pending[s].block_start;
+    int bcount = pending[s].block_count;
+    for (int i = 0; i < bcount; i++) {
+      if (h_output_sizes[s][i] < 0) return false;
+      prefix[bstart + i + 1] = prefix[bstart + i] + (size_t)h_output_sizes[s][i];
+    }
+    int mc = *h_match_count[s];
+    for (int i = 0; i < mc; i++) {
+      int blk = (int)(h_matches[s][i] / max_block_size);
+      size_t off = h_matches[s][i] % max_block_size;
+      result.push_back(prefix[bstart + blk] + off);
+    }
+    pending[s].chunk_idx = -1;
+    return true;
+  };
+
+  int num_chunks = (num_blocks + (int)blocks_per_chunk - 1) / (int)blocks_per_chunk;
+
+  for (int ci = 0; ci < num_chunks && !error; ci++) {
+    int s = ci % 2;
+
+    // flush this slot — waits for chunk ci-2's kernel + D2H and processes results
+    if (!flush_slot(s)) { error = true; break; }
+
+    int bstart = ci * (int)blocks_per_chunk;
+    int bcount = (int)std::min((size_t)(num_blocks - bstart), blocks_per_chunk);
+
+    int threads = 256;
+    int grid    = (bcount + threads - 1) / threads;
+
+    cudaMemsetAsync(d_match_count[s], 0, sizeof(int), streams[s]);
+
+    decompress_and_search_kernel<<<grid, threads, 0, streams[s]>>>(
+        d_compressed, d_blocks + bstart, bcount,
+        d_decompressed[s], d_output_sizes[s], max_block_size,
+        d_pattern, pattern_len,
+        d_matches[s], d_match_count[s], (int)max_matches_per_chunk);
+
+    // async D2H — all on the same stream so they're ordered after the kernel
+    cudaMemcpyAsync(h_output_sizes[s], d_output_sizes[s],
+                    (size_t)bcount * sizeof(int64_t), cudaMemcpyDeviceToHost, streams[s]);
+    cudaMemcpyAsync(h_match_count[s], d_match_count[s],
+                    sizeof(int), cudaMemcpyDeviceToHost, streams[s]);
+    cudaMemcpyAsync(h_matches[s], d_matches[s],
+                    max_matches_per_chunk * sizeof(size_t), cudaMemcpyDeviceToHost, streams[s]);
+
+    pending[s] = {ci, bstart, bcount};
+  }
+
+  // drain remaining slots — flush earlier chunk first so prefix sums are in order
+  if (!error) {
+    int first = 0, second = 1;
+    if (pending[0].chunk_idx >= 0 && pending[1].chunk_idx >= 0 &&
+        pending[1].chunk_idx < pending[0].chunk_idx) {
+      first = 1; second = 0;
+    }
+    if (!flush_slot(first) || !flush_slot(second)) error = true;
+  } else {
+    cudaStreamSynchronize(streams[0]);
+    cudaStreamSynchronize(streams[1]);
+  }
+
+  cudaStreamDestroy(streams[0]);
+  cudaStreamDestroy(streams[1]);
+
+  for (int b = 0; b < 2; b++) {
+    cudaFree(d_decompressed[b]);
+    cudaFree(d_output_sizes[b]);
+    cudaFree(d_matches[b]);
+    cudaFree(d_match_count[b]);
+    cudaFreeHost(h_output_sizes[b]);
+    cudaFreeHost(h_matches[b]);
+    cudaFreeHost(h_match_count[b]);
+  }
 
   cudaFree(d_compressed);
   cudaFree(d_blocks);
-  cudaFree(d_decompressed);
-  cudaFree(d_output_sizes);
   cudaFree(d_pattern);
-  cudaFree(d_matches);
-  cudaFree(d_match_count);
 
-  // compute prefix sums to convert strided offsets to logical offsets
-  // TODO: experiment, maybe we should do this on the gpu?
-  std::vector<size_t> prefix(num_blocks + 1, 0);
-  for (int i = 0; i < num_blocks; i++) {
-    if (output_sizes[i] < 0) return std::nullopt;
-    prefix[i + 1] = prefix[i] + static_cast<size_t>(output_sizes[i]);
-  }
-
-  std::vector<size_t> result;
-  result.reserve(match_count);
-  for (int i = 0; i < match_count; i++) {
-    int block_idx = static_cast<int>(h_matches[i] / max_block_size);
-    size_t within = h_matches[i] % max_block_size;
-    result.push_back(prefix[block_idx] + within);
-  }
-
+  if (error) return std::nullopt;
   return result;
 }
