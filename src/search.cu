@@ -126,7 +126,9 @@ __global__ void decompress_and_search_kernel(
 }
 
 std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size,
-                                                 const std::string &pattern) {
+                                                 const std::string &pattern,
+                                                 size_t *compressed_consumed,
+                                                 size_t *decompressed_size_out) {
   // smallest compressed file size TODO: need to verify
   if (size < 7) return std::nullopt;
 
@@ -179,8 +181,15 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
     if (config.block_checksum) pos += 4;
   }
 
+  // skip optional 4-byte content checksum that follows the endmark
+  if (config.content_checksum) pos += 4;
+  if (compressed_consumed) *compressed_consumed = pos;
+
   int num_blocks = static_cast<int>(blocks.size());
-  if (num_blocks == 0) return std::vector<size_t>{};
+  if (num_blocks == 0) {
+    if (decompressed_size_out) *decompressed_size_out = 0;
+    return std::vector<size_t>{};
+  }
   size_t max_block_size = config.max_block_size_bytes;
   int pattern_len = static_cast<int>(pattern.size());
 
@@ -335,5 +344,32 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
   cudaFree(d_pattern);
 
   if (error) return std::nullopt;
+  if (decompressed_size_out) *decompressed_size_out = prefix[num_blocks];
+  return result;
+}
+
+std::optional<std::vector<size_t>> search_file(const uint8_t *data, size_t size,
+                                                const std::string &pattern) {
+  std::vector<size_t> result;
+  size_t pos = 0;
+  size_t decompressed_base = 0;
+
+  while (pos + 4 <= size) {
+    // stop at anything that isn't an LZ4 frame magic number
+    if (load_u32_le(data + pos) != FRAME_MAGIC_NUMBER) break;
+
+    size_t consumed = 0, decomp_size = 0;
+    auto frame_matches = search_frame(data + pos, size - pos, pattern,
+                                      &consumed, &decomp_size);
+    if (!frame_matches) return std::nullopt;
+
+    for (size_t off : *frame_matches)
+      result.push_back(decompressed_base + off);
+
+    decompressed_base += decomp_size;
+    if (consumed == 0) break; // shouldn't happen, but guard against infinite loop
+    pos += consumed;
+  }
+
   return result;
 }

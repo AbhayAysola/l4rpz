@@ -1,50 +1,75 @@
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
 #include "search.hpp"
 
-// run as l4rpz <pattern> <file.lz4>
+
+static std::vector<uint8_t> read_file(const std::string &path) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file.is_open()) return {};
+
+  file.seekg(0, std::ios::end);
+  std::streamoff file_size = file.tellg();
+  if (file_size < 0) return {};
+  file.seekg(0, std::ios::beg);
+
+  // read the whole compressed file into memory once. this is also the buffer
+  // we would cudaMemcpy to the device in a single transfer. size it up front
+  // and do a single bulk read instead of growing byte-by-byte.
+  std::vector<uint8_t> data(static_cast<size_t>(file_size));
+  if (!file.read(reinterpret_cast<char *>(data.data()), file_size)) return {};
+  return data;
+}
+
+// run as l4rpz <pattern> <file|dir> [file|dir ...]
 int main(int argc, char *argv[]) {
   if (argc < 3) {
+    std::cerr << "usage: l4rpz <pattern> <file|dir> [file|dir ...]\n";
     return 1;
   }
 
   std::string pattern(argv[1]);
 
-  std::ifstream file(argv[2], std::ios::binary);
-  if (!file.is_open()) {
-    std::cerr << "cannot open file!\n";
-    return 1;
+  // collect all .lz4 files, expanding any directory arguments
+  std::vector<std::string> files;
+  for (int i = 2; i < argc; i++) {
+    std::filesystem::path p(argv[i]);
+    if (std::filesystem::is_directory(p)) {
+      for (auto &entry : std::filesystem::recursive_directory_iterator(p)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".lz4")
+          files.push_back(entry.path().string());
+      }
+    } else {
+      files.push_back(argv[i]);
+    }
   }
 
-  // read the whole compressed file into memory once. this is also the buffer
-  // we would cudaMemcpy to the device in a single transfer. size it up front
-  // and do a single bulk read instead of growing byte-by-byte.
-  file.seekg(0, std::ios::end);
-  std::streamoff file_size = file.tellg();
-  if (file_size < 0) {
-    std::cerr << "could not determine file size!\n";
-    return 1;
-  }
-  file.seekg(0, std::ios::beg);
+  bool multiple_files = files.size() > 1;
+  bool any_error = false;
 
-  std::vector<uint8_t> data(static_cast<size_t>(file_size));
-  if (!file.read(reinterpret_cast<char *>(data.data()), file_size)) {
-    std::cerr << "could not read file!\n";
-    return 1;
-  }
+  for (const auto &filepath : files) {
+    auto data = read_file(filepath);
+    if (data.empty()) {
+      std::cerr << filepath << ": cannot read file\n";
+      any_error = true;
+      continue;
+    }
 
-  auto result = search_frame(data.data(), data.size(), pattern);
-  if (!result) {
-    std::cerr << "search failed!\n";
-    return 1;
-  }
+    auto result = search_file(data.data(), data.size(), pattern);
+    if (!result) {
+      std::cerr << filepath << ": search failed\n";
+      any_error = true;
+      continue;
+    }
 
-  for (size_t offset : *result) {
-    std::cout << offset << '\n';
+    for (size_t offset : *result) {
+      if (multiple_files) std::cout << filepath << ':';
+      std::cout << offset << '\n';
+    }
   }
 
-  return 0;
+  return any_error ? 1 : 0;
 }
