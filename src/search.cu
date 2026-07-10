@@ -54,9 +54,14 @@ static __device__ int64_t parse_data_block(const uint8_t *src, size_t src_len,
           dest_pos + num_literals > dest_capacity) {
         return -1;
       }
-      for (size_t i = 0; i < num_literals; i++) {
-        dest[dest_pos + i] = src[src_pos + i];
+      size_t i = 0;
+      while (i + 8 <= num_literals) {
+        uint64_t tmp;
+        __builtin_memcpy(&tmp, src + src_pos + i, 8);
+        __builtin_memcpy(dest + dest_pos + i, &tmp, 8);
+        i += 8;
       }
+      while (i < num_literals) { dest[dest_pos + i] = src[src_pos + i]; i++; }
       src_pos += num_literals;
       dest_pos += num_literals;
     }
@@ -94,9 +99,33 @@ static __device__ int64_t parse_data_block(const uint8_t *src, size_t src_len,
     if (dest_pos + match_length > dest_capacity) {
       return -1;
     }
-    size_t seq_end = match_length + dest_pos;
-    for (; dest_pos < seq_end; dest_pos++) {
+    size_t seq_end = dest_pos + match_length;
+    if (offset >= 8) {
+      while (dest_pos + 8 <= seq_end) {
+        uint64_t tmp;
+        __builtin_memcpy(&tmp, dest + dest_pos - offset, 8);
+        __builtin_memcpy(dest + dest_pos, &tmp, 8);
+        dest_pos += 8;
+      }
+    } else if (offset >= 4) {
+      while (dest_pos + 4 <= seq_end) {
+        uint32_t tmp;
+        __builtin_memcpy(&tmp, dest + dest_pos - offset, 4);
+        __builtin_memcpy(dest + dest_pos, &tmp, 4);
+        dest_pos += 4;
+      }
+    } else if (offset >= 2) {
+      while (dest_pos + 2 <= seq_end) {
+        uint16_t tmp;
+        __builtin_memcpy(&tmp, dest + dest_pos - offset, 2);
+        __builtin_memcpy(dest + dest_pos, &tmp, 2);
+        dest_pos += 2;
+      }
+    }
+    // tail (and all of offset==1 case)
+    while (dest_pos < seq_end) {
       dest[dest_pos] = dest[dest_pos - offset];
+      dest_pos++;
     }
   }
   return static_cast<int64_t>(dest_pos);
@@ -106,37 +135,50 @@ static __device__ uint8_t lower_char(uint8_t c) {
   return (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
 }
 
-// one thread per block: decompress then search. storing strided offsets
-// (i * max_block_size + o) so the cpu can convert to logical offsets using
-// prefix sums of output_sizes after the kernel completes.
+// one cuda block per lz4 block
+// thread 0 decompresses, then all threads cooperate on search
+// keeping decompress and search in one kernel means the decompressed bytes are
+// still in l2 cache when the search threads read them, avoiding a round-trip
+// through dram between two separate kernel launches
+// blockIdx.x  — which lz4 block (0..bcount-1)
+// threadIdx.x — sub-range within the decompressed block (search phase only)
 __global__ void decompress_and_search_kernel(
     const uint8_t *compressed, const LZ4BlockInfo *blocks, int num_blocks,
     uint8_t *decompressed, int64_t *output_sizes, size_t max_block_size,
     const uint8_t *pattern, int pattern_len, bool case_insensitive,
     size_t *matches, int *match_count, int max_matches) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= num_blocks) return;
+  int block_idx = blockIdx.x;
+  if (block_idx >= num_blocks) return;
 
-  uint8_t *dest = decompressed + (size_t)i * max_block_size;
-  int64_t n = parse_data_block(compressed + blocks[i].data_offset,
-                               blocks[i].data_size, blocks[i].is_compressed,
-                               dest, max_block_size);
-  output_sizes[i] = n;
-  if (n < 0 || pattern_len == 0) return;
+  // thread 0 decompresses serially, others wait at the barrier
+  if (threadIdx.x == 0) {
+    uint8_t *dest = decompressed + (size_t)block_idx * max_block_size;
+    output_sizes[block_idx] = parse_data_block(
+        compressed + blocks[block_idx].data_offset,
+        blocks[block_idx].data_size, blocks[block_idx].is_compressed,
+        dest, max_block_size);
+  }
+  __syncthreads();
 
-  // naive pattern search. can be optimized maybe?
-  for (int64_t o = 0; o <= n - pattern_len; o++) {
+  int64_t n = output_sizes[block_idx];
+  if (n < pattern_len) return;
+
+  const uint8_t *src = decompressed + (size_t)block_idx * max_block_size;
+  int64_t positions  = n - pattern_len + 1;
+  int64_t per_thread = (positions + blockDim.x - 1) / blockDim.x;
+  int64_t start      = (int64_t)threadIdx.x * per_thread;
+  int64_t end        = min(start + per_thread, positions);
+
+  for (int64_t o = start; o < end; o++) {
     bool found = true;
     for (int j = 0; j < pattern_len && found; j++) {
-      uint8_t tc = case_insensitive ? lower_char(dest[o + j]) : dest[o + j];
+      uint8_t tc = case_insensitive ? lower_char(src[o + j]) : src[o + j];
       if (tc != pattern[j]) found = false;
     }
     if (found) {
-      // we need atomicAdd here since multiple threads write to match_count at once
-      // maybe theres a better way?
       int idx = atomicAdd(match_count, 1);
       if (idx < max_matches)
-        matches[idx] = (size_t)i * max_block_size + (size_t)o;
+        matches[idx] = (size_t)block_idx * max_block_size + (size_t)o;
     }
   }
 }
@@ -337,19 +379,19 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
     int bstart = ci * (int)blocks_per_chunk;
     int bcount = (int)std::min((size_t)(num_blocks - bstart), blocks_per_chunk);
 
-    int threads = 256;
-    int grid    = (bcount + threads - 1) / threads;
+    static constexpr int THREADS = 256;
 
     if (cudaMemsetAsync(d_match_count[s], 0, sizeof(int), streams[s]) != cudaSuccess) {
       error = true; break;
     }
 
-    decompress_and_search_kernel<<<grid, threads, 0, streams[s]>>>(
+    // one cuda block per lz4 block: thread 0 decompresses, then all
+    // threads search. decompressed data is still hot in l2 when search starts
+    decompress_and_search_kernel<<<bcount, THREADS, 0, streams[s]>>>(
         d_compressed, d_blocks + bstart, bcount,
         d_decompressed[s], d_output_sizes[s], max_block_size,
         d_pattern, pattern_len, case_insensitive,
         d_matches[s], d_match_count[s], (int)max_matches_per_chunk);
-
     if (cudaGetLastError() != cudaSuccess) { error = true; break; }
 
     // async D2H — all on the same stream so they're ordered after the kernel

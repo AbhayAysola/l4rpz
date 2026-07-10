@@ -45,7 +45,7 @@ data = bytearray(open('$tmpdir/base.lz4','rb').read())
 data[6] ^= 0xFF
 open('$tmpdir/bad_hc.lz4','wb').write(data)
 "
-check_exit "header checksum: corrupted HC byte rejected" 1 \
+check_exit "header checksum: corrupted HC byte rejected" 2 \
     "$BINARY" "HELLOWORLD" "$tmpdir/bad_hc.lz4"
 
 # flip a non-HC byte in the header (FLG byte = offset 4) — also changes HC validity
@@ -54,7 +54,7 @@ data = bytearray(open('$tmpdir/base.lz4','rb').read())
 data[4] ^= 0x01  # flip reserved bit in FLG
 open('$tmpdir/bad_flg.lz4','wb').write(data)
 "
-check_exit "header checksum: FLG tampered (HC now wrong) rejected" 1 \
+check_exit "header checksum: FLG tampered (HC now wrong) rejected" 2 \
     "$BINARY" "HELLOWORLD" "$tmpdir/bad_flg.lz4"
 
 # ── block checksum (-BX) ──────────────────────────────────────────────────────
@@ -81,7 +81,7 @@ print(f'block checksum at offset {pos}: {data[pos:pos+4].hex()}')
 data[pos] ^= 0xFF  # corrupt first byte of block checksum
 open('$tmpdir/bad_bx.lz4','wb').write(data)
 "
-check_exit "block checksum: corrupted block checksum rejected" 1 \
+check_exit "block checksum: corrupted block checksum rejected" 2 \
     "$BINARY" "HELLOWORLD" "$tmpdir/bad_bx.lz4"
 
 # multi-block file with block checksums — corrupt checksum of second block
@@ -110,7 +110,7 @@ print(f'second block checksum at offset {pos}')
 data[pos] ^= 0xFF
 open('$tmpdir/big_bad_bx.lz4','wb').write(data)
 "
-check_exit "block checksum: corrupted second block checksum rejected" 1 \
+check_exit "block checksum: corrupted second block checksum rejected" 2 \
     "$BINARY" "HELLOWORLD" "$tmpdir/big_bad_bx.lz4"
 
 # ── content checksum (not yet verified — should still work) ───────────────────
