@@ -100,13 +100,17 @@ static __device__ int64_t parse_data_block(const uint8_t *src, size_t src_len,
   return static_cast<int64_t>(dest_pos);
 }
 
+static __device__ uint8_t lower_char(uint8_t c) {
+  return (c >= 'A' && c <= 'Z') ? (uint8_t)(c + 32) : c;
+}
+
 // one thread per block: decompress then search. storing strided offsets
 // (i * max_block_size + o) so the cpu can convert to logical offsets using
 // prefix sums of output_sizes after the kernel completes.
 __global__ void decompress_and_search_kernel(
     const uint8_t *compressed, const LZ4BlockInfo *blocks, int num_blocks,
     uint8_t *decompressed, int64_t *output_sizes, size_t max_block_size,
-    const uint8_t *pattern, int pattern_len,
+    const uint8_t *pattern, int pattern_len, bool case_insensitive,
     size_t *matches, int *match_count, int max_matches) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= num_blocks) return;
@@ -122,7 +126,8 @@ __global__ void decompress_and_search_kernel(
   for (int64_t o = 0; o <= n - pattern_len; o++) {
     bool found = true;
     for (int j = 0; j < pattern_len && found; j++) {
-      if (dest[o + j] != pattern[j]) found = false;
+      uint8_t tc = case_insensitive ? lower_char(dest[o + j]) : dest[o + j];
+      if (tc != pattern[j]) found = false;
     }
     if (found) {
       // we need atomicAdd here since multiple threads write to match_count at once
@@ -136,6 +141,7 @@ __global__ void decompress_and_search_kernel(
 
 std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size,
                                                  const std::string &pattern,
+                                                 bool case_insensitive,
                                                  size_t *compressed_consumed,
                                                  size_t *decompressed_size_out) {
   // smallest compressed file size TODO: need to verify
@@ -228,8 +234,13 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
   CUDA_CHECK(cudaMemcpy(d_blocks, blocks.data(), (size_t)num_blocks * sizeof(LZ4BlockInfo),
              cudaMemcpyHostToDevice));
 
+  // lowercase the pattern on the host so the kernel only needs to fold text bytes
+  std::string pat = pattern;
+  if (case_insensitive)
+    for (char &c : pat) c = (char)std::tolower((unsigned char)c);
+
   CUDA_CHECK(cudaMalloc(&d_pattern, (size_t)pattern_len));
-  CUDA_CHECK(cudaMemcpy(d_pattern, pattern.data(), (size_t)pattern_len, cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_pattern, pat.data(), (size_t)pattern_len, cudaMemcpyHostToDevice));
 
   // --- compute chunk size from available VRAM ---
   size_t vram_free;
@@ -324,7 +335,7 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
     decompress_and_search_kernel<<<grid, threads, 0, streams[s]>>>(
         d_compressed, d_blocks + bstart, bcount,
         d_decompressed[s], d_output_sizes[s], max_block_size,
-        d_pattern, pattern_len,
+        d_pattern, pattern_len, case_insensitive,
         d_matches[s], d_match_count[s], (int)max_matches_per_chunk);
 
     if (cudaGetLastError() != cudaSuccess) { error = true; break; }
@@ -378,7 +389,8 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
 }
 
 std::optional<std::vector<size_t>> search_file(const uint8_t *data, size_t size,
-                                                const std::string &pattern) {
+                                                const std::string &pattern,
+                                                bool case_insensitive) {
   std::vector<size_t> result;
   size_t pos = 0;
   size_t decompressed_base = 0;
@@ -389,7 +401,7 @@ std::optional<std::vector<size_t>> search_file(const uint8_t *data, size_t size,
 
     size_t consumed = 0, decomp_size = 0;
     auto frame_matches = search_frame(data + pos, size - pos, pattern,
-                                      &consumed, &decomp_size);
+                                      case_insensitive, &consumed, &decomp_size);
     if (!frame_matches) return std::nullopt;
 
     for (size_t off : *frame_matches)

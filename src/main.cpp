@@ -24,18 +24,26 @@ static std::vector<uint8_t> read_file(const std::string &path) {
   return data;
 }
 
-// run as l4rpz <pattern> <file|dir> [file|dir ...]
+// run as l4rpz [-i] <pattern> <file|dir> [file|dir ...]
 int main(int argc, char *argv[]) {
   if (argc < 3) {
-    std::cerr << "usage: l4rpz <pattern> <file|dir> [file|dir ...]\n";
+    std::cerr << "usage: l4rpz [-i] <pattern> <file|dir> [file|dir ...]\n";
     return 1;
   }
 
-  std::string pattern(argv[1]);
+  bool case_insensitive = (std::string(argv[1]) == "-i");
+  int pattern_arg = case_insensitive ? 2 : 1;
+
+  if (argc < pattern_arg + 2) {
+    std::cerr << "usage: l4rpz [-i] <pattern> <file|dir> [file|dir ...]\n";
+    return 1;
+  }
+
+  std::string pattern(argv[pattern_arg]);
 
   // collect all .lz4 files, expanding any directory arguments
   std::vector<std::string> files;
-  for (int i = 2; i < argc; i++) {
+  for (int i = pattern_arg + 1; i < argc; i++) {
     std::filesystem::path p(argv[i]);
     if (std::filesystem::is_directory(p)) {
       for (auto &entry : std::filesystem::recursive_directory_iterator(p)) {
@@ -58,7 +66,7 @@ int main(int argc, char *argv[]) {
       continue;
     }
 
-    auto result = search_file(data.data(), data.size(), pattern);
+    auto result = search_file(data.data(), data.size(), pattern, case_insensitive);
     if (!result) {
       std::cerr << filepath << ": search failed\n";
       any_error = true;
