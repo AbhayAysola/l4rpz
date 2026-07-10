@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include "search.hpp"
 #include "lz4.hpp"
 #include "lz4_frame.hpp"
@@ -143,7 +145,11 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
                                                  const std::string &pattern,
                                                  bool case_insensitive,
                                                  size_t *compressed_consumed,
-                                                 size_t *decompressed_size_out) {
+                                                 size_t *decompressed_size_out,
+                                                 bool bench) {
+  using Clock = std::chrono::steady_clock;
+  using Ms = std::chrono::duration<double, std::milli>;
+  auto t_frame_start = Clock::now();
   // smallest compressed file size TODO: need to verify
   if (size < 7) return std::nullopt;
 
@@ -249,17 +255,21 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
   const size_t headroom = 256ULL << 20; // 256 MB cushion for driver + other allocations TODO: check if this is good enough
   size_t available = (vram_free > headroom) ? vram_free - headroom : 0;
 
-  // worst-case matches per block: every position in the decompressed block
-  size_t max_matches_per_block = max_block_size / (size_t)std::max(pattern_len, 1) + 1;
-  size_t per_block_bytes = max_block_size                           // d_decompressed
-                         + sizeof(int64_t)                          // d_output_sizes
-                         + max_matches_per_block * sizeof(size_t);  // d_matches
+  // cap match buffer at 1M entries (~8MB) regardless of block/chunk size.
+  // matches beyond this are silently dropped (same as -m behaviour).
+  // without this cap, cudaMallocHost allocates gigabytes of pinned memory for
+  // files with large block sizes and short patterns.
+  static constexpr size_t MAX_MATCHES_PER_CHUNK = 1ULL << 20; // 1M matches
+
+  size_t per_block_bytes = max_block_size    // d_decompressed
+                         + sizeof(int64_t);  // d_output_sizes
+  // match buffer cost is shared across the chunk, not per-block
 
   // two buffer slots, so each slot gets half the available space
   size_t blocks_per_chunk = (available / 2) / std::max(per_block_bytes, (size_t)1);
   blocks_per_chunk = std::clamp(blocks_per_chunk, (size_t)1, (size_t)num_blocks);
 
-  size_t max_matches_per_chunk = blocks_per_chunk * max_matches_per_block;
+  size_t max_matches_per_chunk = MAX_MATCHES_PER_CHUNK;
 
   // --- double-buffered device + pinned host allocations ---
   uint8_t  *d_decompressed[2] = {};
@@ -315,6 +325,8 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
   };
 
   int num_chunks = (num_blocks + (int)blocks_per_chunk - 1) / (int)blocks_per_chunk;
+
+  auto t_gpu_start = Clock::now();  // alloc + H2D done; GPU work starts here
 
   for (int ci = 0; ci < num_chunks && !error; ci++) {
     int s = ci % 2;
@@ -383,6 +395,16 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
   cudaFree(d_blocks);
   cudaFree(d_pattern);
 
+  if (bench && !error) {
+    auto t_end = Clock::now();
+    double alloc_ms = Ms(t_gpu_start - t_frame_start).count();
+    double gpu_ms   = Ms(t_end       - t_gpu_start).count();
+    double decomp_mb = (double)prefix[num_blocks] / (1024.0 * 1024.0);
+    double comp_mb   = (double)size / (1024.0 * 1024.0);
+    fprintf(stderr, "[bench] alloc_ms=%.1f gpu_ms=%.1f decomp_mb=%.1f comp_mb=%.2f blocks=%d chunks=%d block_kb=%zu\n",
+            alloc_ms, gpu_ms, decomp_mb, comp_mb, num_blocks, num_chunks, max_block_size / 1024);
+  }
+
   if (error) return std::nullopt;
   if (decompressed_size_out) *decompressed_size_out = prefix[num_blocks];
   return result;
@@ -390,7 +412,8 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
 
 std::optional<std::vector<size_t>> search_file(const uint8_t *data, size_t size,
                                                 const std::string &pattern,
-                                                bool case_insensitive) {
+                                                bool case_insensitive,
+                                                bool bench) {
   std::vector<size_t> result;
   size_t pos = 0;
   size_t decompressed_base = 0;
@@ -401,7 +424,7 @@ std::optional<std::vector<size_t>> search_file(const uint8_t *data, size_t size,
 
     size_t consumed = 0, decomp_size = 0;
     auto frame_matches = search_frame(data + pos, size - pos, pattern,
-                                      case_insensitive, &consumed, &decomp_size);
+                                      case_insensitive, &consumed, &decomp_size, bench);
     if (!frame_matches) return std::nullopt;
 
     for (size_t off : *frame_matches)

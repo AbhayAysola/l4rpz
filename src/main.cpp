@@ -26,17 +26,19 @@ static std::vector<uint8_t> read_file(const std::string &path) {
 }
 
 static void usage() {
-  std::cerr << "usage: l4rpz [-i] [-c] [-L] [-q] <pattern> <file|dir> [file|dir ...]\n";
+  std::cerr << "usage: l4rpz [-i] [-c] [-L] [-q] [-m N] <pattern> <file|dir> [file|dir ...]\n";
 }
 
 // run as l4rpz [options] <pattern> <file|dir> [file|dir ...]
 // default output: prints filenames that have matches (one per file)
 int main(int argc, char *argv[]) {
   static const struct option long_opts[] = {
-      {"ignore-case",           no_argument, nullptr, 'i'},
-      {"count",                 no_argument, nullptr, 'c'},
-      {"files-without-matches", no_argument, nullptr, 'L'},
-      {"quiet",                 no_argument, nullptr, 'q'},
+      {"ignore-case",           no_argument,       nullptr, 'i'},
+      {"count",                 no_argument,       nullptr, 'c'},
+      {"files-without-matches", no_argument,       nullptr, 'L'},
+      {"quiet",                 no_argument,       nullptr, 'q'},
+      {"max-count",             required_argument, nullptr, 'm'},
+      {"bench",                 no_argument,       nullptr, 'B'},
       {nullptr, 0, nullptr, 0},
   };
 
@@ -44,14 +46,21 @@ int main(int argc, char *argv[]) {
   bool count                 = false;
   bool files_without_matches = false;
   bool quiet                 = false;
+  bool bench                 = false;
+  int  max_count             = 0;
 
   int opt;
-  while ((opt = getopt_long(argc, argv, "icLq", long_opts, nullptr)) != -1) {
+  while ((opt = getopt_long(argc, argv, "icLqm:B", long_opts, nullptr)) != -1) {
     switch (opt) {
       case 'i': case_insensitive      = true; break;
       case 'c': count                 = true; break;
       case 'L': files_without_matches = true; break;
       case 'q': quiet                 = true; break;
+      case 'B': bench                 = true; break;
+      case 'm':
+        max_count = std::atoi(optarg);
+        if (max_count <= 0) { std::cerr << "l4rpz: -m requires a positive integer\n"; return 1; }
+        break;
       default: usage(); return 1;
     }
   }
@@ -84,17 +93,20 @@ int main(int argc, char *argv[]) {
       continue;
     }
 
-    auto result = search_file(data.data(), data.size(), pattern, case_insensitive);
+    auto result = search_file(data.data(), data.size(), pattern, case_insensitive, bench);
     if (!result) {
       std::cerr << filepath << ": search failed\n";
       any_error = true;
       continue;
     }
 
+    if (max_count > 0 && (int)result->size() > max_count)
+      result->resize((size_t)max_count);
+
     bool has_match = !result->empty();
     if (has_match) any_match = true;
 
-    if (quiet && has_match) return 0;
+    if (quiet && has_match && !any_error) return 0;
 
     if (files_without_matches) {
       if (!has_match) std::cout << filepath << '\n';
@@ -105,6 +117,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  if (any_error) return 2;
   if (quiet) return any_match ? 0 : 1;
-  return any_error ? 1 : 0;
+  return 0;
 }
