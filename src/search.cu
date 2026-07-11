@@ -11,6 +11,7 @@
 // returns std::nullopt on any cuda error — used for setup/teardown calls only.
 // for errors inside the main processing loop we set error=true and let the
 // drain path clean up properly before returning.
+// do while trick from tsoding on youtube
 #define CUDA_CHECK(expr) \
     do { if ((expr) != cudaSuccess) return std::nullopt; } while(0)
 
@@ -24,9 +25,14 @@ static __device__ int64_t parse_data_block(const uint8_t *src, size_t src_len,
     if (src_len > dest_capacity) {
       return -1;
     }
-    for (size_t i = 0; i < src_len; i++) {
-      dest[i] = src[i];
+    size_t i = 0;
+    while (i + 8 <= src_len) {
+      uint64_t tmp;
+      __builtin_memcpy(&tmp, src + i, 8);
+      __builtin_memcpy(dest + i, &tmp, 8);
+      i += 8;
     }
+    while (i < src_len) { dest[i] = src[i]; i++; };
     return static_cast<int64_t>(src_len);
   }
 
@@ -169,6 +175,7 @@ __global__ void decompress_and_search_kernel(
   int64_t start      = (int64_t)threadIdx.x * per_thread;
   int64_t end        = min(start + per_thread, positions);
 
+  // TODO: better search algorithm
   for (int64_t o = start; o < end; o++) {
     bool found = true;
     for (int j = 0; j < pattern_len && found; j++) {

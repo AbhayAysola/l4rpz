@@ -5,6 +5,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include "lz4_frame.hpp"
 #include "search.hpp"
 
 
@@ -20,6 +21,7 @@ static std::vector<uint8_t> read_file(const std::string &path) {
   // read the whole compressed file into memory once. this is also the buffer
   // we would cudaMemcpy to the device in a single transfer. size it up front
   // and do a single bulk read instead of growing byte-by-byte.
+  // TODO: for larger files we'd need to stream, or else it would not fit in RAM
   std::vector<uint8_t> data(static_cast<size_t>(file_size));
   if (!file.read(reinterpret_cast<char *>(data.data()), file_size)) return {};
   return data;
@@ -69,6 +71,7 @@ int main(int argc, char *argv[]) {
 
   std::string pattern(argv[optind]);
 
+  // read all the files and recursively read .lz4 in directories
   std::vector<std::string> files;
   for (int i = optind + 1; i < argc; i++) {
     std::filesystem::path p(argv[i]);
@@ -93,13 +96,22 @@ int main(int argc, char *argv[]) {
       continue;
     }
 
-    auto result = search_file(data.data(), data.size(), pattern, case_insensitive, bench);
-    if (!result) {
-      std::cerr << filepath << ": search failed\n";
+    // allow non .lz4 files also
+    if (data.size() < 4 || load_u32_le(data.data()) != FRAME_MAGIC_NUMBER) {
+      std::cerr << filepath << ": not an LZ4 file\n";
       any_error = true;
       continue;
     }
 
+    auto result = search_file(data.data(), data.size(), pattern, case_insensitive, bench);
+    if (!result) {
+      std::cerr << filepath << ": invalid LZ4 file\n";
+      any_error = true;
+      continue;
+    }
+
+    // truncate if max_count is passed
+    // TODO: early exit on the gpu directly
     if (max_count > 0 && (int)result->size() > max_count)
       result->resize((size_t)max_count);
 
@@ -118,6 +130,5 @@ int main(int argc, char *argv[]) {
   }
 
   if (any_error) return 2;
-  if (quiet) return any_match ? 0 : 1;
-  return 0;
+  return any_match ? 0 : 1;
 }
