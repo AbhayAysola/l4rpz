@@ -66,3 +66,8 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# benchmark data (silesia corpus — run tests/get_silesia.sh to populate)
+data/silesia/
+data/silesia_lz4/
+data/silesia_lz4_b4/
