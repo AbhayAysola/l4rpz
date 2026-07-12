@@ -9,22 +9,22 @@
 #include "search.hpp"
 
 
-static std::vector<uint8_t> read_file(const std::string &path) {
+// reads path into ctx's pinned file buffer. returns the number of bytes read,
+// or 0 on failure. pinned memory lets the driver DMA directly on cudaMemcpy
+// without staging through a temporary buffer
+static size_t read_file_pinned(const std::string &path, GpuContext *ctx) {
   std::ifstream file(path, std::ios::binary);
-  if (!file.is_open()) return {};
+  if (!file.is_open()) return 0;
 
   file.seekg(0, std::ios::end);
   std::streamoff file_size = file.tellg();
-  if (file_size < 0) return {};
+  if (file_size <= 0) return 0;
   file.seekg(0, std::ios::beg);
 
-  // read the whole compressed file into memory once. this is also the buffer
-  // we would cudaMemcpy to the device in a single transfer. size it up front
-  // and do a single bulk read instead of growing byte-by-byte.
-  // TODO: for larger files we'd need to stream, or else it would not fit in RAM
-  std::vector<uint8_t> data(static_cast<size_t>(file_size));
-  if (!file.read(reinterpret_cast<char *>(data.data()), file_size)) return {};
-  return data;
+  auto *buf = gpu_file_buf(ctx, static_cast<size_t>(file_size));
+  if (!buf) return 0;
+  if (!file.read(reinterpret_cast<char *>(buf), file_size)) return 0;
+  return static_cast<size_t>(file_size);
 }
 
 static void usage() {
@@ -85,25 +85,30 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  GpuContext *ctx = make_gpu_context();
+  if (!ctx) { std::cerr << "l4rpz: failed to initialize GPU\n"; return 2; }
+
   bool any_match = false;
   bool any_error = false;
 
   for (const auto &filepath : files) {
-    auto data = read_file(filepath);
-    if (data.empty()) {
+    size_t file_size = read_file_pinned(filepath, ctx);
+    if (file_size == 0) {
       std::cerr << filepath << ": cannot read file\n";
       any_error = true;
       continue;
     }
 
+    const uint8_t *data = gpu_file_buf(ctx, file_size);
+
     // allow non .lz4 files also
-    if (data.size() < 4 || load_u32_le(data.data()) != FRAME_MAGIC_NUMBER) {
+    if (file_size < 4 || load_u32_le(data) != FRAME_MAGIC_NUMBER) {
       std::cerr << filepath << ": not an LZ4 file\n";
       any_error = true;
       continue;
     }
 
-    auto result = search_file(data.data(), data.size(), pattern, case_insensitive, bench);
+    auto result = search_file(data, file_size, pattern, ctx, case_insensitive, bench);
     if (!result) {
       std::cerr << filepath << ": invalid LZ4 file\n";
       any_error = true;
@@ -129,6 +134,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  free_gpu_context(ctx);
   if (any_error) return 2;
   return any_match ? 0 : 1;
 }

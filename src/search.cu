@@ -8,12 +8,128 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
-// returns std::nullopt on any cuda error — used for setup/teardown calls only.
-// for errors inside the main processing loop we set error=true and let the
-// drain path clean up properly before returning.
+// returns std::nullopt on any cuda error — used for memcpy/memset calls inside
+// search_frame. setup errors go through GpuContext::ensure_* which return bool
 // do while trick from tsoding on youtube
 #define CUDA_CHECK(expr) \
     do { if ((expr) != cudaSuccess) return std::nullopt; } while(0)
+
+// grow a device allocation in place. no-op if already large enough
+static bool dev_grow(void **ptr, size_t *cap, size_t needed) {
+  if (needed <= *cap) return true;
+  cudaFree(*ptr); *ptr = nullptr;
+  if (cudaMalloc(ptr, needed) != cudaSuccess) return false;
+  *cap = needed;
+  return true;
+}
+
+// grow a pinned host allocation in place. no-op if already large enough
+static bool pin_grow(void **ptr, size_t *cap, size_t needed) {
+  if (needed <= *cap) return true;
+  cudaFreeHost(*ptr); *ptr = nullptr;
+  if (cudaMallocHost(ptr, needed) != cudaSuccess) return false;
+  *cap = needed;
+  return true;
+}
+
+struct GpuContext {
+  cudaStream_t  streams[2] = {};
+
+  // device buffers — per-file, grown lazily
+  uint8_t *d_compressed = nullptr;
+  LZ4BlockInfo *d_blocks = nullptr;
+  uint8_t *d_pattern = nullptr;
+  size_t d_compressed_cap = 0;
+  size_t d_blocks_cap = 0;
+  size_t d_pattern_cap = 0;
+
+  // double-buffered slot allocations
+  uint8_t *d_decompressed[2]  = {};
+  int64_t *d_output_sizes[2]  = {};
+  size_t *d_matches[2] = {};
+  int *d_match_count[2] = {};  // always sizeof(int), allocated in make_gpu_context
+  size_t d_decomp_cap = 0;     // bytes per slot
+  size_t d_outsizes_cap = 0;   // bytes per slot
+  size_t d_matches_cap = 0;    // bytes per slot
+
+  // pinned host buffers
+  uint8_t *h_file = nullptr;
+  size_t h_file_cap = 0;
+  int64_t *h_output_sizes[2] = {};
+  size_t *h_matches[2] = {};
+  int *h_match_count[2] = {};    // always sizeof(int), allocated in make_gpu_context
+
+  bool ensure_compressed(size_t n) {return dev_grow((void**)&d_compressed, &d_compressed_cap, n);}
+  bool ensure_blocks(size_t n) {return dev_grow((void**)&d_blocks, &d_blocks_cap, n);}
+  bool ensure_pattern(size_t n) {return dev_grow((void**)&d_pattern, &d_pattern_cap, n);}
+  bool ensure_file(size_t n) {return pin_grow((void**)&h_file, &h_file_cap, n);}
+
+  bool ensure_slots(size_t decomp, size_t osizes, size_t matches) {
+    if (decomp > d_decomp_cap) {
+      for (int b = 0; b < 2; b++) {
+        cudaFree(d_decompressed[b]);
+        if (cudaMalloc(&d_decompressed[b], decomp) != cudaSuccess) return false;
+      }
+      d_decomp_cap = decomp;
+    }
+    if (osizes > d_outsizes_cap) {
+      for (int b = 0; b < 2; b++) {
+        cudaFree(d_output_sizes[b]);
+        cudaFreeHost(h_output_sizes[b]);
+        if (cudaMalloc(&d_output_sizes[b], osizes) != cudaSuccess) return false;
+        if (cudaMallocHost(&h_output_sizes[b], osizes) != cudaSuccess) return false;
+      }
+      d_outsizes_cap = osizes;
+    }
+    if (matches > d_matches_cap) {
+      for (int b = 0; b < 2; b++) {
+        cudaFree(d_matches[b]);
+        cudaFreeHost(h_matches[b]);
+        if (cudaMalloc(&d_matches[b], matches) != cudaSuccess) return false;
+        if (cudaMallocHost(&h_matches[b], matches) != cudaSuccess) return false;
+      }
+      d_matches_cap = matches;
+    }
+    return true;
+  }
+};
+
+GpuContext *make_gpu_context() {
+  auto *ctx = new GpuContext();
+  if (cudaStreamCreate(&ctx->streams[0]) != cudaSuccess ||
+    cudaStreamCreate(&ctx->streams[1]) != cudaSuccess ||
+    cudaMalloc(&ctx->d_match_count[0], sizeof(int)) != cudaSuccess ||
+    cudaMalloc(&ctx->d_match_count[1], sizeof(int)) != cudaSuccess ||
+    cudaMallocHost(&ctx->h_match_count[0], sizeof(int)) != cudaSuccess ||
+    cudaMallocHost(&ctx->h_match_count[1], sizeof(int)) != cudaSuccess) {
+    free_gpu_context(ctx);
+    return nullptr;
+  }
+  return ctx;
+}
+
+void free_gpu_context(GpuContext *ctx) {
+  if (!ctx) return;
+  cudaStreamDestroy(ctx->streams[0]);
+  cudaStreamDestroy(ctx->streams[1]);
+  cudaFree(ctx->d_compressed);
+  cudaFree(ctx->d_blocks);
+  cudaFree(ctx->d_pattern);
+  for (int b = 0; b < 2; b++) {
+    cudaFree(ctx->d_decompressed[b]);
+    cudaFree(ctx->d_output_sizes[b]);
+    cudaFree(ctx->d_matches[b]);
+    cudaFree(ctx->d_match_count[b]);
+    cudaFreeHost(ctx->h_output_sizes[b]);
+    cudaFreeHost(ctx->h_matches[b]);
+    cudaFreeHost(ctx->h_match_count[b]);
+  }
+  cudaFreeHost(ctx->h_file);
+}
+
+uint8_t *gpu_file_buf(GpuContext *ctx, size_t needed) {
+  return ctx->ensure_file(needed) ? ctx->h_file : nullptr;
+}
 
 // decompresses one lz4 block from src (src_len bytes) into dest (which holds
 // dest_capacity bytes). returns the number of uncompressed bytes, or -1 on a
@@ -153,10 +269,13 @@ __global__ void decompress_and_search_kernel(
     uint8_t *decompressed, int64_t *output_sizes, size_t max_block_size,
     const uint8_t *pattern, int pattern_len, bool case_insensitive,
     size_t *matches, int *match_count, int max_matches) {
+  extern __shared__ uint8_t s_pat[];
+
   int block_idx = blockIdx.x;
   if (block_idx >= num_blocks) return;
 
-  // thread 0 decompresses serially, others wait at the barrier
+  // thread 0 decompresses while the other warps load the pattern into shared
+  // memory.  both happen before the barrier so neither stalls waiting for the other
   if (threadIdx.x == 0) {
     uint8_t *dest = decompressed + (size_t)block_idx * max_block_size;
     output_sizes[block_idx] = parse_data_block(
@@ -164,6 +283,8 @@ __global__ void decompress_and_search_kernel(
         blocks[block_idx].data_size, blocks[block_idx].is_compressed,
         dest, max_block_size);
   }
+  for (int i = threadIdx.x; i < pattern_len; i += blockDim.x)
+    s_pat[i] = pattern[i];
   __syncthreads();
 
   int64_t n = output_sizes[block_idx];
@@ -180,7 +301,7 @@ __global__ void decompress_and_search_kernel(
     bool found = true;
     for (int j = 0; j < pattern_len && found; j++) {
       uint8_t tc = case_insensitive ? lower_char(src[o + j]) : src[o + j];
-      if (tc != pattern[j]) found = false;
+      if (tc != s_pat[j]) found = false;
     }
     if (found) {
       int idx = atomicAdd(match_count, 1);
@@ -192,6 +313,7 @@ __global__ void decompress_and_search_kernel(
 
 std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size,
                                                  const std::string &pattern,
+                                                 GpuContext *ctx,
                                                  bool case_insensitive,
                                                  size_t *compressed_consumed,
                                                  size_t *decompressed_size_out,
@@ -277,16 +399,12 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
   size_t max_block_size = config.max_block_size_bytes;
   int pattern_len = static_cast<int>(pattern.size());
 
-  // --- fixed allocations: stay on device across all chunks ---
-  uint8_t    *d_compressed = nullptr;
-  LZ4BlockInfo *d_blocks   = nullptr;
-  uint8_t    *d_pattern    = nullptr;
+  // ensure per file device buffers are large enough, then upload
+  if (!ctx->ensure_compressed(size)) return std::nullopt;
+  CUDA_CHECK(cudaMemcpy(ctx->d_compressed, data, size, cudaMemcpyHostToDevice));
 
-  CUDA_CHECK(cudaMalloc(&d_compressed, size));
-  CUDA_CHECK(cudaMemcpy(d_compressed, data, size, cudaMemcpyHostToDevice));
-
-  CUDA_CHECK(cudaMalloc(&d_blocks, (size_t)num_blocks * sizeof(LZ4BlockInfo)));
-  CUDA_CHECK(cudaMemcpy(d_blocks, blocks.data(), (size_t)num_blocks * sizeof(LZ4BlockInfo),
+  if (!ctx->ensure_blocks((size_t)num_blocks * sizeof(LZ4BlockInfo))) return std::nullopt;
+  CUDA_CHECK(cudaMemcpy(ctx->d_blocks, blocks.data(), (size_t)num_blocks * sizeof(LZ4BlockInfo),
              cudaMemcpyHostToDevice));
 
   // lowercase the pattern on the host so the kernel only needs to fold text bytes
@@ -294,8 +412,8 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
   if (case_insensitive)
     for (char &c : pat) c = (char)std::tolower((unsigned char)c);
 
-  CUDA_CHECK(cudaMalloc(&d_pattern, (size_t)pattern_len));
-  CUDA_CHECK(cudaMemcpy(d_pattern, pat.data(), (size_t)pattern_len, cudaMemcpyHostToDevice));
+  if (!ctx->ensure_pattern((size_t)pattern_len)) return std::nullopt;
+  CUDA_CHECK(cudaMemcpy(ctx->d_pattern, pat.data(), (size_t)pattern_len, cudaMemcpyHostToDevice));
 
   // --- compute chunk size from available VRAM ---
   size_t vram_free;
@@ -320,30 +438,10 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
 
   size_t max_matches_per_chunk = MAX_MATCHES_PER_CHUNK;
 
-  // --- double-buffered device + pinned host allocations ---
-  uint8_t  *d_decompressed[2] = {};
-  int64_t  *d_output_sizes[2] = {};
-  size_t   *d_matches[2]      = {};
-  int      *d_match_count[2]  = {};
-
-  int64_t  *h_output_sizes[2] = {};
-  size_t   *h_matches[2]      = {};
-  int      *h_match_count[2]  = {};
-
-  for (int b = 0; b < 2; b++) {
-    CUDA_CHECK(cudaMalloc(&d_decompressed[b], blocks_per_chunk * max_block_size));
-    CUDA_CHECK(cudaMalloc(&d_output_sizes[b], blocks_per_chunk * sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&d_matches[b],  max_matches_per_chunk * sizeof(size_t)));
-    CUDA_CHECK(cudaMalloc(&d_match_count[b],  sizeof(int)));
-    CUDA_CHECK(cudaMallocHost(&h_output_sizes[b], blocks_per_chunk * sizeof(int64_t)));
-    CUDA_CHECK(cudaMallocHost(&h_matches[b],      max_matches_per_chunk * sizeof(size_t)));
-    CUDA_CHECK(cudaMallocHost(&h_match_count[b],  sizeof(int)));
-    *h_match_count[b] = 0;
-  }
-
-  cudaStream_t streams[2];
-  CUDA_CHECK(cudaStreamCreate(&streams[0]));
-  CUDA_CHECK(cudaStreamCreate(&streams[1]));
+  // ensure double-buffered slot allocations are large enough
+  if (!ctx->ensure_slots(blocks_per_chunk * max_block_size,
+                         blocks_per_chunk * sizeof(int64_t),
+                         max_matches_per_chunk * sizeof(size_t))) return std::nullopt;
 
   // prefix[i] = logical byte offset at the start of block i across the whole frame
   std::vector<size_t> prefix(num_blocks + 1, 0);
@@ -356,17 +454,17 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
   // sync slot s, fill prefix sums, convert strided offsets to logical, clear pending
   auto flush_slot = [&](int s) -> bool {
     if (pending[s].chunk_idx < 0) return true;
-    if (cudaStreamSynchronize(streams[s]) != cudaSuccess) return false;
+    if (cudaStreamSynchronize(ctx->streams[s]) != cudaSuccess) return false;
     int bstart = pending[s].block_start;
     int bcount = pending[s].block_count;
     for (int i = 0; i < bcount; i++) {
-      if (h_output_sizes[s][i] < 0) return false;
-      prefix[bstart + i + 1] = prefix[bstart + i] + (size_t)h_output_sizes[s][i];
+      if (ctx->h_output_sizes[s][i] < 0) return false;
+      prefix[bstart + i + 1] = prefix[bstart + i] + (size_t)ctx->h_output_sizes[s][i];
     }
-    int mc = *h_match_count[s];
+    int mc = *ctx->h_match_count[s];
     for (int i = 0; i < mc; i++) {
-      int blk = (int)(h_matches[s][i] / max_block_size);
-      size_t off = h_matches[s][i] % max_block_size;
+      int blk = (int)(ctx->h_matches[s][i] / max_block_size);
+      size_t off = ctx->h_matches[s][i] % max_block_size;
       result.push_back(prefix[bstart + blk] + off);
     }
     pending[s].chunk_idx = -1;
@@ -388,26 +486,26 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
 
     static constexpr int THREADS = 256;
 
-    if (cudaMemsetAsync(d_match_count[s], 0, sizeof(int), streams[s]) != cudaSuccess) {
+    if (cudaMemsetAsync(ctx->d_match_count[s], 0, sizeof(int), ctx->streams[s]) != cudaSuccess) {
       error = true; break;
     }
 
     // one cuda block per lz4 block: thread 0 decompresses, then all
     // threads search. decompressed data is still hot in l2 when search starts
-    decompress_and_search_kernel<<<bcount, THREADS, 0, streams[s]>>>(
-        d_compressed, d_blocks + bstart, bcount,
-        d_decompressed[s], d_output_sizes[s], max_block_size,
-        d_pattern, pattern_len, case_insensitive,
-        d_matches[s], d_match_count[s], (int)max_matches_per_chunk);
+    decompress_and_search_kernel<<<bcount, THREADS, (size_t)pattern_len, ctx->streams[s]>>>(
+        ctx->d_compressed, ctx->d_blocks + bstart, bcount,
+        ctx->d_decompressed[s], ctx->d_output_sizes[s], max_block_size,
+        ctx->d_pattern, pattern_len, case_insensitive,
+        ctx->d_matches[s], ctx->d_match_count[s], (int)max_matches_per_chunk);
     if (cudaGetLastError() != cudaSuccess) { error = true; break; }
 
     // async D2H — all on the same stream so they're ordered after the kernel
-    if (cudaMemcpyAsync(h_output_sizes[s], d_output_sizes[s],
-                    (size_t)bcount * sizeof(int64_t), cudaMemcpyDeviceToHost, streams[s]) != cudaSuccess ||
-        cudaMemcpyAsync(h_match_count[s], d_match_count[s],
-                    sizeof(int), cudaMemcpyDeviceToHost, streams[s]) != cudaSuccess ||
-        cudaMemcpyAsync(h_matches[s], d_matches[s],
-                    max_matches_per_chunk * sizeof(size_t), cudaMemcpyDeviceToHost, streams[s]) != cudaSuccess) {
+    if (cudaMemcpyAsync(ctx->h_output_sizes[s], ctx->d_output_sizes[s],
+                    (size_t)bcount * sizeof(int64_t), cudaMemcpyDeviceToHost, ctx->streams[s]) != cudaSuccess ||
+        cudaMemcpyAsync(ctx->h_match_count[s], ctx->d_match_count[s],
+                    sizeof(int), cudaMemcpyDeviceToHost, ctx->streams[s]) != cudaSuccess ||
+        cudaMemcpyAsync(ctx->h_matches[s], ctx->d_matches[s],
+                    max_matches_per_chunk * sizeof(size_t), cudaMemcpyDeviceToHost, ctx->streams[s]) != cudaSuccess) {
       error = true; break;
     }
 
@@ -423,26 +521,9 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
     }
     if (!flush_slot(first) || !flush_slot(second)) error = true;
   } else {
-    cudaStreamSynchronize(streams[0]);
-    cudaStreamSynchronize(streams[1]);
+    cudaStreamSynchronize(ctx->streams[0]);
+    cudaStreamSynchronize(ctx->streams[1]);
   }
-
-  cudaStreamDestroy(streams[0]);
-  cudaStreamDestroy(streams[1]);
-
-  for (int b = 0; b < 2; b++) {
-    cudaFree(d_decompressed[b]);
-    cudaFree(d_output_sizes[b]);
-    cudaFree(d_matches[b]);
-    cudaFree(d_match_count[b]);
-    cudaFreeHost(h_output_sizes[b]);
-    cudaFreeHost(h_matches[b]);
-    cudaFreeHost(h_match_count[b]);
-  }
-
-  cudaFree(d_compressed);
-  cudaFree(d_blocks);
-  cudaFree(d_pattern);
 
   if (bench && !error) {
     auto t_end = Clock::now();
@@ -461,6 +542,7 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
 
 std::optional<std::vector<size_t>> search_file(const uint8_t *data, size_t size,
                                                 const std::string &pattern,
+                                                GpuContext *ctx,
                                                 bool case_insensitive,
                                                 bool bench) {
   std::vector<size_t> result;
@@ -473,7 +555,7 @@ std::optional<std::vector<size_t>> search_file(const uint8_t *data, size_t size,
 
     size_t consumed = 0, decomp_size = 0;
     auto frame_matches = search_frame(data + pos, size - pos, pattern,
-                                      case_insensitive, &consumed, &decomp_size, bench);
+                                      ctx, case_insensitive, &consumed, &decomp_size, bench);
     if (!frame_matches) return std::nullopt;
 
     for (size_t off : *frame_matches)
