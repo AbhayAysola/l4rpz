@@ -143,6 +143,41 @@ def test_uncompressed(tmp: Path):
     check_exit("uncompressed multi block: no match (exit 1)", 1, "NOTHERE", str(multi_unc))
 
 
+# block boundary matching
+
+def test_block_boundary(tmp: Path):
+    B = 64 * 1024  # lz4 -B4 block size
+
+    # pattern split 1/2: last byte of block 0, first two bytes of block 1
+    data = b"A" * (B - 1) + b"HIT" + b"B" * 100
+    f = make_lz4(data, tmp, "seam1", flags=["-B4"])
+    check_exit("block boundary: pattern split 1+2 bytes", 0, "HIT", str(f))
+    check("block boundary: correct offset", f"{f}:{B - 1}", run("HIT", str(f))[0])
+
+    # pattern split 2/1: last two bytes of block 0, first byte of block 1
+    data = b"A" * (B - 2) + b"HIT" + b"B" * 100
+    f = make_lz4(data, tmp, "seam2", flags=["-B4"])
+    check_exit("block boundary: pattern split 2+1 bytes", 0, "HIT", str(f))
+    check("block boundary: correct offset", f"{f}:{B - 2}", run("HIT", str(f))[0])
+
+    # longer pattern straddling: only part of pattern in each block
+    pat = "LONGERPATTERN"
+    data = b"A" * (B - 5) + pat.encode() + b"B" * 100
+    f = make_lz4(data, tmp, "seam_long", flags=["-B4"])
+    check_exit("block boundary: longer pattern straddling", 0, pat, str(f))
+    check("block boundary: longer pattern correct offset", f"{f}:{B - 5}", run(pat, str(f))[0])
+
+    # no false positive: pattern not present
+    data = b"A" * (B - 1) + b"XYZ" + b"B" * 100
+    f = make_lz4(data, tmp, "seam_miss", flags=["-B4"])
+    check_exit("block boundary: no false positive", 1, "HIT", str(f))
+
+    # multiple seams: three blocks, patterns at both boundaries
+    data = b"A" * (B - 1) + b"HIT" + b"B" * (B - 3) + b"HIT" + b"C" * 100
+    f = make_lz4(data, tmp, "seam_multi", flags=["-B4"])
+    check("block boundary: two seam matches", f"{f}:2", run("-c", "HIT", str(f))[0])
+
+
 # flags
 
 def test_flags(tmp: Path):
@@ -266,6 +301,7 @@ def main():
         test_checksums(tmp)
         test_multi_frame(tmp)
         test_uncompressed(tmp)
+        test_block_boundary(tmp)
         test_flags(tmp)
 
     print(f"\n{PASS} passed, {FAIL} failed")

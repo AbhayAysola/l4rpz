@@ -311,6 +311,25 @@ __global__ void decompress_and_search_kernel(
   }
 }
 
+// naive cpu pattern search over a small buffer. needle is already lowercased
+// when case_insensitive is true (matches kernel convention). outputs to `out`
+// with each match offset shifted by `base`
+static void cpu_search(const uint8_t *src, size_t src_len,
+                       const uint8_t *pat, int pat_len,
+                       bool case_insensitive, size_t base,
+                       std::vector<size_t> &out) {
+  if (pat_len <= 0 || src_len < (size_t)pat_len) return;
+  for (size_t i = 0; i <= src_len - (size_t)pat_len; i++) {
+    bool match = true;
+    for (int j = 0; j < pat_len && match; j++) {
+      uint8_t c = src[i + j];
+      if (case_insensitive) c = (uint8_t)std::tolower((unsigned char)c);
+      match = (c == pat[j]);
+    }
+    if (match) out.push_back(base + i);
+  }
+}
+
 std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size,
                                                  const std::string &pattern,
                                                  GpuContext *ctx,
@@ -450,11 +469,16 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
   std::vector<size_t> prefix(num_blocks + 1, 0);
   std::vector<size_t> result;
 
+  // seam stitching state: tail bytes saved from the last flushed chunk's final block
+  std::vector<uint8_t> seam_tail_buf;
+  size_t seam_tail_base  = 0; // global decompressed offset of seam_tail_buf[0]
+  int    seam_tail_block = -1; // global block index the tail came from
+
   struct PendingChunk { int chunk_idx, block_start, block_count; };
   PendingChunk pending[2] = {{-1, 0, 0}, {-1, 0, 0}};
   bool error = false;
 
-  // sync slot s, fill prefix sums, convert strided offsets to logical, clear pending
+  // sync slot s, fill prefix sums, convert strided offsets to logical, stitch seams, clear pending
   auto flush_slot = [&](int s) -> bool {
     if (pending[s].chunk_idx < 0) return true;
     if (cudaStreamSynchronize(ctx->streams[s]) != cudaSuccess) return false;
@@ -470,6 +494,70 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
       size_t off = ctx->h_matches[s][i] % max_block_size;
       result.push_back(prefix[bstart + blk] + off);
     }
+
+    // seam stitching: find matches that straddle block boundaries
+    // these are missed by the gpu kernel which searches each block independently.
+    // seam window = last (plen-1) bytes of block i + first (plen-1) bytes of block i+1.
+    // any match in this window necessarily spans the boundary, so no duplicates with gpu.
+    if (pattern_len > 1) {
+      const uint8_t *cpat = (const uint8_t *)pat.data();
+
+      // small synchronous D2H: stream already synced, these are tiny (at most plen-1 bytes)
+      auto d2h = [&](size_t dev_off, size_t len, uint8_t *dst) -> bool {
+        return cudaMemcpy(dst, ctx->d_decompressed[s] + dev_off, len,
+                          cudaMemcpyDeviceToHost) == cudaSuccess;
+      };
+
+      // inter-chunk seam: between the last block of the previous chunk and block bstart
+      if (bstart > 0 && seam_tail_block == bstart - 1 && !seam_tail_buf.empty()) {
+        size_t blk0_size = (size_t)ctx->h_output_sizes[s][0];
+        size_t head_len  = std::min((size_t)(pattern_len - 1), blk0_size);
+        if (!seam_tail_buf.empty() && seam_tail_buf.size() + head_len >= (size_t)pattern_len) {
+          std::vector<uint8_t> seam(seam_tail_buf.size() + head_len);
+          std::copy(seam_tail_buf.begin(), seam_tail_buf.end(), seam.begin());
+          if (d2h(0, head_len, seam.data() + seam_tail_buf.size())) {
+            cpu_search(seam.data(), seam.size(), cpat, pattern_len,
+                       case_insensitive, seam_tail_base, result);
+          }
+        }
+      }
+
+      // intra-chunk seams: between adjacent blocks within this chunk
+      for (int i = 0; i < bcount - 1; i++) {
+        size_t blk_i_sz  = (size_t)ctx->h_output_sizes[s][i];
+        size_t blk_i1_sz = (size_t)ctx->h_output_sizes[s][i + 1];
+        size_t tail_len  = std::min((size_t)(pattern_len - 1), blk_i_sz);
+        size_t head_len  = std::min((size_t)(pattern_len - 1), blk_i1_sz);
+        if (tail_len + head_len < (size_t)pattern_len) continue;
+
+        std::vector<uint8_t> seam(tail_len + head_len);
+        size_t tail_dev = (size_t)i * max_block_size + blk_i_sz - tail_len;
+        size_t head_dev = (size_t)(i + 1) * max_block_size;
+        if (d2h(tail_dev, tail_len, seam.data()) &&
+            d2h(head_dev, head_len, seam.data() + tail_len)) {
+          size_t seam_base = prefix[bstart + i] + blk_i_sz - tail_len;
+          cpu_search(seam.data(), seam.size(), cpat, pattern_len,
+                     case_insensitive, seam_base, result);
+        }
+      }
+
+      // save tail of this chunk's last block for the inter-chunk seam with the next chunk
+      {
+        int last = bcount - 1;
+        size_t last_sz  = (size_t)ctx->h_output_sizes[s][last];
+        size_t tail_len = std::min((size_t)(pattern_len - 1), last_sz);
+        seam_tail_buf.resize(tail_len);
+        if (tail_len > 0 && d2h((size_t)last * max_block_size + last_sz - tail_len,
+                                 tail_len, seam_tail_buf.data())) {
+          seam_tail_base  = prefix[bstart + last] + last_sz - tail_len;
+          seam_tail_block = bstart + last;
+        } else {
+          seam_tail_buf.clear();
+          seam_tail_block = -1;
+        }
+      }
+    }
+
     pending[s].chunk_idx = -1;
     return true;
   };
@@ -540,6 +628,7 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
 
   if (error) return std::nullopt;
   if (decompressed_size_out) *decompressed_size_out = prefix[num_blocks];
+  std::sort(result.begin(), result.end());
   return result;
 }
 
