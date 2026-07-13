@@ -28,19 +28,20 @@ static size_t read_file_pinned(const std::string &path, GpuContext *ctx) {
 }
 
 static void usage() {
-  std::cerr << "usage: l4rpz [-i] [-c] [-L] [-q] [-m N] <pattern> <file|dir> [file|dir ...]\n";
+  std::cerr << "usage: l4rpz [-i] [-c] [-L] [-q] [-V] [-m N] <pattern> <file|dir> [file|dir ...]\n";
 }
 
 // run as l4rpz [options] <pattern> <file|dir> [file|dir ...]
 // default output: prints filenames that have matches (one per file)
 int main(int argc, char *argv[]) {
   static const struct option long_opts[] = {
-      {"ignore-case",           no_argument,       nullptr, 'i'},
-      {"count",                 no_argument,       nullptr, 'c'},
-      {"files-without-matches", no_argument,       nullptr, 'L'},
-      {"quiet",                 no_argument,       nullptr, 'q'},
-      {"max-count",             required_argument, nullptr, 'm'},
-      {"bench",                 no_argument,       nullptr, 'B'},
+      {"ignore-case",           no_argument,       nullptr, 'i'}, // case-insensitive pattern matching
+      {"only-count",            no_argument,       nullptr, 'c'}, // print filename:count instead of filename:offset per match
+      {"files-without-matches", no_argument,       nullptr, 'L'}, // print only filenames with no matches
+      {"quiet",                 no_argument,       nullptr, 'q'}, // no output; exit 0 if any match, 1 if none
+      {"max-count",             required_argument, nullptr, 'm'}, // stop after N matches per file
+      {"no-verify",             no_argument,       nullptr, 'V'}, // skip header and block checksum verification
+      {"bench",                 no_argument,       nullptr, 'B'}, // emit per-frame timing to stderr
       {nullptr, 0, nullptr, 0},
   };
 
@@ -49,15 +50,17 @@ int main(int argc, char *argv[]) {
   bool files_without_matches = false;
   bool quiet                 = false;
   bool bench                 = false;
+  bool verify_checksums      = true;
   int  max_count             = 0;
 
   int opt;
-  while ((opt = getopt_long(argc, argv, "icLqm:B", long_opts, nullptr)) != -1) {
+  while ((opt = getopt_long(argc, argv, "icLqm:VB", long_opts, nullptr)) != -1) {
     switch (opt) {
       case 'i': case_insensitive      = true; break;
       case 'c': count                 = true; break;
       case 'L': files_without_matches = true; break;
       case 'q': quiet                 = true; break;
+      case 'V': verify_checksums      = false; break;
       case 'B': bench                 = true; break;
       case 'm':
         max_count = std::atoi(optarg);
@@ -108,7 +111,7 @@ int main(int argc, char *argv[]) {
       continue;
     }
 
-    auto result = search_file(data, file_size, pattern, ctx, case_insensitive, bench);
+    auto result = search_file(data, file_size, pattern, ctx, case_insensitive, bench, verify_checksums);
     if (!result) {
       std::cerr << filepath << ": invalid LZ4 file\n";
       any_error = true;
@@ -130,7 +133,8 @@ int main(int argc, char *argv[]) {
     } else if (count) {
       if (has_match) std::cout << filepath << ':' << result->size() << '\n';
     } else {
-      if (has_match) std::cout << filepath << '\n';
+      for (size_t offset : *result)
+        std::cout << filepath << ':' << offset << '\n';
     }
   }
 

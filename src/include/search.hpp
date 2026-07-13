@@ -27,7 +27,8 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
                                                 bool case_insensitive = false,
                                                 size_t *compressed_consumed = nullptr,
                                                 size_t *decompressed_size_out = nullptr,
-                                                bool bench = false);
+                                                bool bench = false,
+                                                bool verify_checksums = true);
 
 // searches all lz4 frames in data (a complete file). returns byte offsets of
 // all matches across all frames in decompressed order, or nullopt on error.
@@ -35,4 +36,5 @@ std::optional<std::vector<size_t>> search_file(const uint8_t *data, size_t size,
                                                const std::string &pattern,
                                                GpuContext *ctx,
                                                bool case_insensitive = false,
-                                               bool bench = false);
+                                               bool bench = false,
+                                               bool verify_checksums = true);

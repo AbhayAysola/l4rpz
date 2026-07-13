@@ -317,7 +317,8 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
                                                  bool case_insensitive,
                                                  size_t *compressed_consumed,
                                                  size_t *decompressed_size_out,
-                                                 bool bench) {
+                                                 bool bench,
+                                                 bool verify_checksums) {
   using Clock = std::chrono::steady_clock;
   using Ms = std::chrono::duration<double, std::milli>;
   auto t_frame_start = Clock::now();
@@ -346,7 +347,7 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
 
   // verifythe header checksum: HC = (xxHash32(frame_descriptor) >> 8) & 0xFF
   // frame descriptor spans from the FLG byte up to (not including) HC
-  {
+  if (verify_checksums) {
     const uint8_t *descriptor = data + 4; // starts at FLG
     size_t descriptor_len = pos - 4;
     uint8_t computed_hc = (XXH32(descriptor, descriptor_len, 0) >> 8) & 0xFF;
@@ -377,9 +378,11 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
     // verify block checksum (xxHash32 of compressed block data)
     if (config.block_checksum) {
       if (pos + 4 > size) break;
-      uint32_t stored   = load_u32_le(data + pos);
-      uint32_t computed = XXH32(data + block.data_offset, block.data_size, 0);
-      if (computed != stored) return std::nullopt;
+      if (verify_checksums) {
+        uint32_t stored   = load_u32_le(data + pos);
+        uint32_t computed = XXH32(data + block.data_offset, block.data_size, 0);
+        if (computed != stored) return std::nullopt;
+      }
       pos += 4;
     }
 
@@ -544,7 +547,8 @@ std::optional<std::vector<size_t>> search_file(const uint8_t *data, size_t size,
                                                 const std::string &pattern,
                                                 GpuContext *ctx,
                                                 bool case_insensitive,
-                                                bool bench) {
+                                                bool bench,
+                                                bool verify_checksums) {
   std::vector<size_t> result;
   size_t pos = 0;
   size_t decompressed_base = 0;
@@ -555,7 +559,8 @@ std::optional<std::vector<size_t>> search_file(const uint8_t *data, size_t size,
 
     size_t consumed = 0, decomp_size = 0;
     auto frame_matches = search_frame(data + pos, size - pos, pattern,
-                                      ctx, case_insensitive, &consumed, &decomp_size, bench);
+                                      ctx, case_insensitive, &consumed, &decomp_size, bench,
+                                      verify_checksums);
     if (!frame_matches) return std::nullopt;
 
     for (size_t off : *frame_matches)

@@ -98,7 +98,7 @@ def test_multi_frame(tmp: Path):
     f1 = tmp / "f1.lz4"
     f1.write_bytes(make_lz4(b"AAAA", tmp, "f1a").read_bytes() +
                    make_lz4(b"FINDME", tmp, "f1b").read_bytes())
-    check("multi frame: match only in second frame", str(f1), run("FINDME", str(f1))[0])
+    check("multi frame: match only in second frame", f"{f1}:4", run("FINDME", str(f1))[0])
 
     f2 = tmp / "f2.lz4"
     f2.write_bytes(make_lz4(b"HIT and miss", tmp, "f2a").read_bytes() +
@@ -127,7 +127,7 @@ def test_uncompressed(tmp: Path):
 
     check_exit("uncompressed block: match found (exit 0)", 0, "PATTERN", str(rand))
     check_exit("uncompressed block: no match (exit 1)", 1, "NOTHERE", str(rand))
-    check("uncompressed block: filename printed on match", str(rand), run("PATTERN", str(rand))[0])
+    check("uncompressed block: offset printed on match", f"{rand}:1000", run("PATTERN", str(rand))[0])
 
     data2 = bytearray(os.urandom(128 * 1024))
     data2[-7:] = b"PATTERN"
@@ -147,20 +147,20 @@ def test_uncompressed(tmp: Path):
 
 def test_flags(tmp: Path):
     s1 = make_lz4(b"hello world", tmp, "s1")
-    check("single file: filename printed on match", str(s1), run("hello", str(s1))[0])
+    check("single file: offset printed on match", f"{s1}:0", run("hello", str(s1))[0])
     check("single file: no output on no match", "", run("zzz", str(s1))[0])
     check_exit("single file: exit 0 on match", 0, "hello", str(s1))
     check_exit("single file: exit 1 on no match", 1, "zzz", str(s1))
 
     m1 = make_lz4(b"MATCH here", tmp, "m1")
     m2 = make_lz4(b"no match here", tmp, "m2")
-    check("multi file: only matching file printed", str(m1), run("MATCH", str(m1), str(m2))[0])
+    check("multi file: only matching file printed", f"{m1}:0", run("MATCH", str(m1), str(m2))[0])
     check("multi file: -L prints non-matching file", str(m2), run("-L", "MATCH", str(m1), str(m2))[0])
 
     (tmp / "dir" / "sub").mkdir(parents=True)
     da = make_lz4(b"FOUND it", tmp / "dir", "a")
     make_lz4(b"nothing here", tmp / "dir" / "sub", "b")
-    check("directory: finds .lz4 files recursively", str(da), run("FOUND", str(tmp / "dir"))[0])
+    check("directory: finds .lz4 files recursively", f"{da}:0", run("FOUND", str(tmp / "dir"))[0])
 
     check_exit("-q: match exits 0", 0, "-q", "hello", str(s1))
     check_exit("-q: no match exits 1", 1, "-q", "zzz", str(s1))
@@ -168,7 +168,7 @@ def test_flags(tmp: Path):
 
     multi_hit = make_lz4(b"hit and hit again", tmp, "multi_hit")
     check("-c: count is 2", f"{multi_hit}:2", run("-c", "hit", str(multi_hit))[0])
-    check("-i: case-insensitive match", str(s1), run("-i", "HELLO", str(s1))[0])
+    check("-i: case-insensitive match", f"{s1}:0", run("-i", "HELLO", str(s1))[0])
     check("-m 1: truncates to 1 match", f"{multi_hit}:1", run("-c", "-m", "1", "hit", str(multi_hit))[0])
 
     plain = tmp / "plain.txt"
