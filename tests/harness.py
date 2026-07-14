@@ -210,6 +210,15 @@ def test_flags(tmp: Path):
     plain.write_text("hello")
     check_exit("non-lz4 file: exit 2", 2, "hello", str(plain))
 
+    # -x hex pattern
+    hex_file = make_lz4(b"\x00\xff\x42 hello", tmp, "hex_file")
+    check("-x: matches binary pattern", f"{hex_file}:0", run("-x", "0x00ff42", str(hex_file))[0])
+    check("-x: uppercase hex works", f"{hex_file}:0", run("-x", "0x00FF42", str(hex_file))[0])
+    check("-x: no 0x prefix works", f"{hex_file}:0", run("-x", "00ff42", str(hex_file))[0])
+    check_exit("-x: no match exits 1", 1, "-x", "0xffffff", str(hex_file))
+    check_exit("-x: invalid hex exits 2", 2, "-x", "0xgg", str(hex_file))
+    check_exit("-x: odd length exits 2", 2, "-x", "0xabc", str(hex_file))
+
 
 # benchmarks
 

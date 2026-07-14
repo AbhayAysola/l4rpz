@@ -1,8 +1,10 @@
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 #include "lz4_frame.hpp"
@@ -28,7 +30,31 @@ static size_t read_file_pinned(const std::string &path, GpuContext *ctx) {
 }
 
 static void usage() {
-  std::cerr << "usage: l4rpz [-i] [-c] [-L] [-q] [-V] [-m N] <pattern> <file|dir> [file|dir ...]\n";
+  std::cerr << "usage: l4rpz [-i] [-x] [-c] [-L] [-q] [-V] [-m N] <pattern> <file|dir> [file|dir ...]\n";
+}
+
+// parses a hex string like "0xff1122" or "ff1122" into raw bytes.
+// returns nullopt if the string is malformed (odd length, non-hex chars, empty).
+static std::optional<std::string> parse_hex_pattern(const std::string &s) {
+  const char *p = s.c_str();
+  if (s.size() >= 2 && p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+    p += 2;
+  size_t len = strlen(p);
+  if (len == 0 || len % 2 != 0) return std::nullopt;
+  auto hex_digit = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  std::string out;
+  out.reserve(len / 2);
+  for (size_t i = 0; i < len; i += 2) {
+    int hi = hex_digit(p[i]), lo = hex_digit(p[i + 1]);
+    if (hi < 0 || lo < 0) return std::nullopt;
+    out.push_back((char)((hi << 4) | lo));
+  }
+  return out;
 }
 
 // run as l4rpz [options] <pattern> <file|dir> [file|dir ...]
@@ -40,6 +66,7 @@ int main(int argc, char *argv[]) {
       {"quiet",                 no_argument,       nullptr, 'q'}, // no output; exit 0 if any match, 1 if none
       {"max-count",             required_argument, nullptr, 'm'}, // stop after N matches per file
       {"no-verify",             no_argument,       nullptr, 'V'}, // skip header and block checksum verification
+      {"hex",                   no_argument,       nullptr, 'x'}, // interpret pattern as a hex string (e.g. 0xff1122)
       {"bench",                 no_argument,       nullptr, 'B'}, // emit per-frame timing to stderr
       {nullptr, 0, nullptr, 0},
   };
@@ -50,16 +77,18 @@ int main(int argc, char *argv[]) {
   bool quiet                 = false;
   bool bench                 = false;
   bool verify_checksums      = true;
+  bool hex_pattern           = false;
   int  max_count             = 0;
 
   int opt;
-  while ((opt = getopt_long(argc, argv, "icLqm:VB", long_opts, nullptr)) != -1) {
+  while ((opt = getopt_long(argc, argv, "icLqm:VxB", long_opts, nullptr)) != -1) {
     switch (opt) {
       case 'i': case_insensitive      = true; break;
       case 'c': count                 = true; break;
       case 'L': files_without_matches = true; break;
       case 'q': quiet                 = true; break;
       case 'V': verify_checksums      = false; break;
+      case 'x': hex_pattern           = true; break;
       case 'B': bench                 = true; break;
       case 'm':
         max_count = std::atoi(optarg);
@@ -72,6 +101,11 @@ int main(int argc, char *argv[]) {
   if (optind + 2 > argc) { usage(); return 1; }
 
   std::string pattern(argv[optind]);
+  if (hex_pattern) {
+    auto parsed = parse_hex_pattern(pattern);
+    if (!parsed) { std::cerr << "l4rpz: invalid hex pattern: " << pattern << '\n'; return 2; }
+    pattern = std::move(*parsed);
+  }
 
   // read all the files and recursively read .lz4 in directories
   std::vector<std::string> files;
