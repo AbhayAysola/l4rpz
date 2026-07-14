@@ -40,6 +40,15 @@ offset is in decompressed bytes. with `-c` it's `filename:count`, with `-L` it's
 | `1` | no match |
 | `2` | error (unreadable file, invalid lz4, GPU init failure) |
 
+## Benchmarking
+run the silesia corpus download script if running the benchmarks
+
+`./tests/get_silesia.sh`
+
+then run the python script
+
+`python tests/harness.py`
+
 ## Todo
 
 - AMD support
