@@ -48,9 +48,11 @@ struct GpuContext {
   int64_t *d_output_sizes[2]  = {};
   size_t *d_matches[2] = {};
   int *d_match_count[2] = {};  // always sizeof(int), allocated in make_gpu_context
+  uint8_t *d_seams[2] = {};
   size_t d_decomp_cap = 0;     // bytes per slot
   size_t d_outsizes_cap = 0;   // bytes per slot
   size_t d_matches_cap = 0;    // bytes per slot
+  size_t d_seams_cap = 0;      // bytes per slot
 
   // pinned host buffers
   uint8_t *h_file = nullptr;
@@ -58,11 +60,24 @@ struct GpuContext {
   int64_t *h_output_sizes[2] = {};
   size_t *h_matches[2] = {};
   int *h_match_count[2] = {};    // always sizeof(int), allocated in make_gpu_context
+  uint8_t *h_seams[2] = {};
 
   bool ensure_compressed(size_t n) {return dev_grow((void**)&d_compressed, &d_compressed_cap, n);}
   bool ensure_blocks(size_t n) {return dev_grow((void**)&d_blocks, &d_blocks_cap, n);}
   bool ensure_pattern(size_t n) {return dev_grow((void**)&d_pattern, &d_pattern_cap, n);}
   bool ensure_file(size_t n) {return pin_grow((void**)&h_file, &h_file_cap, n);}
+
+  bool ensure_seams(size_t n) {
+    if (n <= d_seams_cap) return true;
+    for (int b = 0; b < 2; b++) {
+      cudaFree(d_seams[b]);
+      cudaFreeHost(h_seams[b]);
+      if (cudaMalloc(&d_seams[b], n) != cudaSuccess) return false;
+      if (cudaMallocHost(&h_seams[b], n) != cudaSuccess) return false;
+    }
+    d_seams_cap = n;
+    return true;
+  }
 
   bool ensure_slots(size_t decomp, size_t osizes, size_t matches) {
     if (decomp > d_decomp_cap) {
@@ -120,9 +135,11 @@ void free_gpu_context(GpuContext *ctx) {
     cudaFree(ctx->d_output_sizes[b]);
     cudaFree(ctx->d_matches[b]);
     cudaFree(ctx->d_match_count[b]);
+    cudaFree(ctx->d_seams[b]);
     cudaFreeHost(ctx->h_output_sizes[b]);
     cudaFreeHost(ctx->h_matches[b]);
     cudaFreeHost(ctx->h_match_count[b]);
+    cudaFreeHost(ctx->h_seams[b]);
   }
   cudaFreeHost(ctx->h_file);
 }
@@ -269,13 +286,9 @@ __global__ void decompress_and_search_kernel(
     uint8_t *decompressed, int64_t *output_sizes, size_t max_block_size,
     const uint8_t *pattern, int pattern_len, bool case_insensitive,
     size_t *matches, int *match_count, int max_matches) {
-  extern __shared__ uint8_t s_pat[];
-
   int block_idx = blockIdx.x;
   if (block_idx >= num_blocks) return;
 
-  // thread 0 decompresses while the other warps load the pattern into shared
-  // memory.  both happen before the barrier so neither stalls waiting for the other
   if (threadIdx.x == 0) {
     uint8_t *dest = decompressed + (size_t)block_idx * max_block_size;
     output_sizes[block_idx] = parse_data_block(
@@ -283,31 +296,53 @@ __global__ void decompress_and_search_kernel(
         blocks[block_idx].data_size, blocks[block_idx].is_compressed,
         dest, max_block_size);
   }
-  for (int i = threadIdx.x; i < pattern_len; i += blockDim.x)
-    s_pat[i] = pattern[i];
-  __syncthreads();
+  __syncthreads(); // wait for thread 0 to finish decompressing
 
   int64_t n = output_sizes[block_idx];
   if (n < pattern_len) return;
 
   const uint8_t *src = decompressed + (size_t)block_idx * max_block_size;
-  int64_t positions  = n - pattern_len + 1;
+  int64_t positions = n - pattern_len + 1;
   int64_t per_thread = (positions + blockDim.x - 1) / blockDim.x;
-  int64_t start      = (int64_t)threadIdx.x * per_thread;
-  int64_t end        = min(start + per_thread, positions);
+  int64_t start = (int64_t)threadIdx.x * per_thread;
+  int64_t end = min(start + per_thread, positions);
 
   // TODO: better search algorithm
   for (int64_t o = start; o < end; o++) {
     bool found = true;
     for (int j = 0; j < pattern_len && found; j++) {
       uint8_t tc = case_insensitive ? lower_char(src[o + j]) : src[o + j];
-      if (tc != s_pat[j]) found = false;
+      if (tc != pattern[j]) found = false;
     }
     if (found) {
       int idx = atomicAdd(match_count, 1);
       if (idx < max_matches)
         matches[idx] = (size_t)block_idx * max_block_size + (size_t)o;
     }
+  }
+}
+
+// packs the tail and head of each block into seams[]:
+// seams[bi * 2*pw .. bi*2*pw + pw - 1]      = last pw bytes of block bi (tail)
+// seams[bi * 2*pw + pw .. bi*2*pw + 2*pw-1] = first pw bytes of block bi (head)
+// pw = pattern_len - 1. blocks shorter than pw are filled up to their actual size.
+__global__ void extract_seams_kernel(
+    const uint8_t *decompressed, size_t max_block_size,
+    const int64_t *output_sizes, int bcount, int pw,
+    uint8_t *seams) {
+  int bi = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (bi >= bcount) return;
+
+  int64_t sz = output_sizes[bi];
+  if (sz < 0) sz = 0;
+
+  const uint8_t *blk = decompressed + (size_t)bi * max_block_size;
+  uint8_t *out = seams + (size_t)bi * 2 * pw;
+
+  const uint8_t *tail_src = blk + sz - pw;
+  for (int j = 0; j < pw; j++) {
+    out[pw + j] = blk[j];
+    out[j] = tail_src[j];
   }
 }
 
@@ -465,6 +500,12 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
                          blocks_per_chunk * sizeof(int64_t),
                          max_matches_per_chunk * sizeof(size_t))) return std::nullopt;
 
+  // seam stitching only if pattern greater than 1 (block boundary actually matters)
+  if (pattern_len > 1) {
+    size_t seam_bytes = blocks_per_chunk * 2 * (size_t)(pattern_len - 1);
+    if (!ctx->ensure_seams(seam_bytes)) return std::nullopt;
+  }
+
   // prefix[i] = logical byte offset at the start of block i across the whole frame
   std::vector<size_t> prefix(num_blocks + 1, 0);
   std::vector<size_t> result;
@@ -499,62 +540,55 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
     // these are missed by the gpu kernel which searches each block independently.
     // seam window = last (plen-1) bytes of block i + first (plen-1) bytes of block i+1.
     // any match in this window necessarily spans the boundary, so no duplicates with gpu.
+    // h_seams[s] was filled by extract_seams_kernel and copied async — no extra D2H here.
     if (pattern_len > 1) {
+      int pw = pattern_len - 1;
       const uint8_t *cpat = (const uint8_t *)pat.data();
-
-      // small synchronous D2H: stream already synced, these are tiny (at most plen-1 bytes)
-      auto d2h = [&](size_t dev_off, size_t len, uint8_t *dst) -> bool {
-        return cudaMemcpy(dst, ctx->d_decompressed[s] + dev_off, len,
-                          cudaMemcpyDeviceToHost) == cudaSuccess;
-      };
 
       // inter-chunk seam: between the last block of the previous chunk and block bstart
       if (bstart > 0 && seam_tail_block == bstart - 1 && !seam_tail_buf.empty()) {
         size_t blk0_size = (size_t)ctx->h_output_sizes[s][0];
-        size_t head_len  = std::min((size_t)(pattern_len - 1), blk0_size);
-        if (!seam_tail_buf.empty() && seam_tail_buf.size() + head_len >= (size_t)pattern_len) {
-          std::vector<uint8_t> seam(seam_tail_buf.size() + head_len);
-          std::copy(seam_tail_buf.begin(), seam_tail_buf.end(), seam.begin());
-          if (d2h(0, head_len, seam.data() + seam_tail_buf.size())) {
-            cpu_search(seam.data(), seam.size(), cpat, pattern_len,
-                       case_insensitive, seam_tail_base, result);
-          }
-        }
+        size_t head_len  = std::min((size_t)pw, blk0_size);
+        // head of block 0 is at h_seams[s][0*2*pw + pw]
+        const uint8_t *head = ctx->h_seams[s] + pw;
+        std::vector<uint8_t> seam(seam_tail_buf.size() + head_len);
+        std::copy(seam_tail_buf.begin(), seam_tail_buf.end(), seam.begin());
+        std::copy(head, head + head_len, seam.begin() + seam_tail_buf.size());
+        cpu_search(seam.data(), seam.size(), cpat, pattern_len,
+                   case_insensitive, seam_tail_base, result);
       }
 
       // intra-chunk seams: between adjacent blocks within this chunk
+      std::vector<uint8_t> seam_buf;
+      seam_buf.reserve(2 * pw);
       for (int i = 0; i < bcount - 1; i++) {
         size_t blk_i_sz  = (size_t)ctx->h_output_sizes[s][i];
         size_t blk_i1_sz = (size_t)ctx->h_output_sizes[s][i + 1];
-        size_t tail_len  = std::min((size_t)(pattern_len - 1), blk_i_sz);
-        size_t head_len  = std::min((size_t)(pattern_len - 1), blk_i1_sz);
+        size_t tail_len  = std::min((size_t)pw, blk_i_sz);
+        size_t head_len  = std::min((size_t)pw, blk_i1_sz);
         if (tail_len + head_len < (size_t)pattern_len) continue;
 
-        std::vector<uint8_t> seam(tail_len + head_len);
-        size_t tail_dev = (size_t)i * max_block_size + blk_i_sz - tail_len;
-        size_t head_dev = (size_t)(i + 1) * max_block_size;
-        if (d2h(tail_dev, tail_len, seam.data()) &&
-            d2h(head_dev, head_len, seam.data() + tail_len)) {
-          size_t seam_base = prefix[bstart + i] + blk_i_sz - tail_len;
-          cpu_search(seam.data(), seam.size(), cpat, pattern_len,
-                     case_insensitive, seam_base, result);
-        }
+        // h_seams layout per block: [tail (pw bytes)] [head (pw bytes)]
+        const uint8_t *tail = ctx->h_seams[s] + (size_t)i * 2 * pw;
+        const uint8_t *head = ctx->h_seams[s] + (size_t)(i + 1) * 2 * pw + pw;
+        seam_buf.resize(tail_len + head_len);
+        std::copy(tail, tail + tail_len, seam_buf.begin());
+        std::copy(head, head + head_len, seam_buf.begin() + tail_len);
+
+        size_t seam_base = prefix[bstart + i] + blk_i_sz - tail_len;
+        cpu_search(seam_buf.data(), seam_buf.size(), cpat, pattern_len,
+                   case_insensitive, seam_base, result);
       }
 
       // save tail of this chunk's last block for the inter-chunk seam with the next chunk
       {
         int last = bcount - 1;
         size_t last_sz  = (size_t)ctx->h_output_sizes[s][last];
-        size_t tail_len = std::min((size_t)(pattern_len - 1), last_sz);
-        seam_tail_buf.resize(tail_len);
-        if (tail_len > 0 && d2h((size_t)last * max_block_size + last_sz - tail_len,
-                                 tail_len, seam_tail_buf.data())) {
-          seam_tail_base  = prefix[bstart + last] + last_sz - tail_len;
-          seam_tail_block = bstart + last;
-        } else {
-          seam_tail_buf.clear();
-          seam_tail_block = -1;
-        }
+        size_t tail_len = std::min((size_t)pw, last_sz);
+        const uint8_t *tail = ctx->h_seams[s] + (size_t)last * 2 * pw;
+        seam_tail_buf.assign(tail, tail + tail_len);
+        seam_tail_base  = prefix[bstart + last] + last_sz - tail_len;
+        seam_tail_block = bstart + last;
       }
     }
 
@@ -583,22 +617,38 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
 
     // one cuda block per lz4 block: thread 0 decompresses, then all
     // threads search. decompressed data is still hot in l2 when search starts
-    decompress_and_search_kernel<<<bcount, THREADS, (size_t)pattern_len, ctx->streams[s]>>>(
+    decompress_and_search_kernel<<<bcount, THREADS, 0, ctx->streams[s]>>>(
         ctx->d_compressed, ctx->d_blocks + bstart, bcount,
         ctx->d_decompressed[s], ctx->d_output_sizes[s], max_block_size,
         ctx->d_pattern, pattern_len, case_insensitive,
         ctx->d_matches[s], ctx->d_match_count[s], (int)max_matches_per_chunk);
     if (cudaGetLastError() != cudaSuccess) { error = true; break; }
 
-    // async D2H — all on the same stream so they're ordered after the kernel
-    if (cudaMemcpyAsync(ctx->h_output_sizes[s], ctx->d_output_sizes[s],
-                    (size_t)bcount * sizeof(int64_t), cudaMemcpyDeviceToHost, ctx->streams[s]) != cudaSuccess ||
-        cudaMemcpyAsync(ctx->h_match_count[s], ctx->d_match_count[s],
-                    sizeof(int), cudaMemcpyDeviceToHost, ctx->streams[s]) != cudaSuccess ||
-        cudaMemcpyAsync(ctx->h_matches[s], ctx->d_matches[s],
-                    max_matches_per_chunk * sizeof(size_t), cudaMemcpyDeviceToHost, ctx->streams[s]) != cudaSuccess) {
-      error = true; break;
+    // extract tail+head of each block into a compact seam buffer for cpu stitching
+    if (pattern_len > 1) {
+      int pw = pattern_len - 1;
+      int seam_threads = 256;
+      int seam_blocks  = (bcount + seam_threads - 1) / seam_threads;
+      extract_seams_kernel<<<seam_blocks, seam_threads, 0, ctx->streams[s]>>>(
+          ctx->d_decompressed[s], max_block_size,
+          ctx->d_output_sizes[s], bcount, pw, ctx->d_seams[s]);
+      if (cudaGetLastError() != cudaSuccess) { error = true; break; }
     }
+
+    // async D2H — all on the same stream so they're ordered after the kernels
+    bool d2h_ok =
+        cudaMemcpyAsync(ctx->h_output_sizes[s], ctx->d_output_sizes[s],
+                        (size_t)bcount * sizeof(int64_t), cudaMemcpyDeviceToHost, ctx->streams[s]) == cudaSuccess &&
+        cudaMemcpyAsync(ctx->h_match_count[s], ctx->d_match_count[s],
+                        sizeof(int), cudaMemcpyDeviceToHost, ctx->streams[s]) == cudaSuccess &&
+        cudaMemcpyAsync(ctx->h_matches[s], ctx->d_matches[s],
+                        max_matches_per_chunk * sizeof(size_t), cudaMemcpyDeviceToHost, ctx->streams[s]) == cudaSuccess;
+    if (d2h_ok && pattern_len > 1) {
+      size_t seam_bytes = (size_t)bcount * 2 * (size_t)(pattern_len - 1);
+      d2h_ok = cudaMemcpyAsync(ctx->h_seams[s], ctx->d_seams[s],
+                               seam_bytes, cudaMemcpyDeviceToHost, ctx->streams[s]) == cudaSuccess;
+    }
+    if (!d2h_ok) { error = true; break; }
 
     pending[s] = {ci, bstart, bcount};
   }

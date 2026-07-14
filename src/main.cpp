@@ -32,7 +32,6 @@ static void usage() {
 }
 
 // run as l4rpz [options] <pattern> <file|dir> [file|dir ...]
-// default output: prints filenames that have matches (one per file)
 int main(int argc, char *argv[]) {
   static const struct option long_opts[] = {
       {"ignore-case",           no_argument,       nullptr, 'i'}, // case-insensitive pattern matching
