@@ -243,7 +243,7 @@ def _parse_bench(stderr):
         gpu_ms += float(f.get("gpu_ms",0))
         decomp_mb += float(f.get("decomp_mb", 0))
         blocks += int(f.get("blocks", 0))
-        block_kb += int(f.get("block_kb", block_kb))
+        block_kb = int(f.get("block_kb", block_kb))
     return alloc_ms, gpu_ms, decomp_mb, blocks, block_kb
 
 def _bench_file(path, pattern):

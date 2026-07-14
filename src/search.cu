@@ -395,9 +395,13 @@ std::optional<std::vector<size_t>> search_frame(const uint8_t *data, size_t size
   if (!config.block_independence) return std::nullopt;
   if (config.max_block_size_bytes == 0) return std::nullopt;
 
-  // TODO: deal with content_size and dict_id properly
   if (config.content_size_present) pos += 8;
-  if (config.dict_id_present) pos += 4;
+  if (config.dict_id_present) {
+    if (pos + 4 > size) return std::nullopt;
+    uint32_t dict_id = load_u32_le(data + pos);
+    if (dict_id != 0) return std::nullopt; // external dictionaries not supported
+    pos += 4;
+  }
 
   // verifythe header checksum: HC = (xxHash32(frame_descriptor) >> 8) & 0xFF
   // frame descriptor spans from the FLG byte up to (not including) HC
