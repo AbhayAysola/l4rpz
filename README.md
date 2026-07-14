@@ -15,7 +15,6 @@ offset is in decompressed bytes. with `-c` it's `filename:count`, with `-L` it's
 ## Features
 
 - byte string search over lz4 compressed data
-- pattern is a raw string
 - catches patterns that straddle block boundaries
 - multi-frame files supported
 - requires independent blocks (lz4 default)
